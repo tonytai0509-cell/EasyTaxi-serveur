@@ -281,3 +281,4 @@ def update_job_status(job_id: str, body: JobStatusUpdate):
     conn.close()
 
     return {"ok": True}
+

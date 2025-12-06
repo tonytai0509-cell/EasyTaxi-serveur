@@ -1,38 +1,29 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal
+from uuid import uuid4
 
 app = FastAPI()
 
-# ---------- Modèles ----------
+# ---------------------------
+# Modèle pour la position
+# ---------------------------
 
 class UpdateLocation(BaseModel):
     driver_id: str
     latitude: float
     longitude: float
-    status: str
+    status: str # "online" / "offline" par ex.
 
-class Job(BaseModel):
-    driver_id: str
-    customer_name: str
-    address: str
-    phone: str
-    comment: Optional[str] = ""
-
-class JobStatusUpdate(BaseModel):
-    status: str # "new", "accepted", "done", etc.
-
-# ---------- Données en mémoire ----------
-
+# driver_id -> données du chauffeur
 drivers: Dict[str, Dict] = {}
-jobs: Dict[str, Dict] = {} # clé = driver_id
 
-# ---------- Routes existantes ----------
 
 @app.get("/")
 def root():
     return {"status": "Server is running"}
+
 
 @app.post("/update-location")
 def update_location(payload: UpdateLocation):
@@ -46,38 +37,53 @@ def update_location(payload: UpdateLocation):
     print("Nouvelles données :", drivers[payload.driver_id])
     return {"ok": True}
 
+
 @app.get("/drivers")
 def get_drivers() -> List[Dict]:
+    """
+    Retourne la liste de TOUS les chauffeurs connectés.
+    """
     return list(drivers.values())
 
-# ---------- 🎯 Nouvelles routes courses ----------
+# ---------------------------
+# Modèles pour les courses
+# ---------------------------
 
-@app.post("/send-job")
-def send_job(payload: Job):
-    job = {
+# Ce que la centrale envoie quand elle crée une course
+class NewJob(BaseModel):
+    driver_id: str # taxi01, taxi02, ...
+    client_name: str # Nom du client
+    pickup_address: str # Adresse de prise en charge
+    dropoff_address: str | None = None # Destination (optionnel)
+    phone: str | None = None # Téléphone client
+    comment: str | None = None # Commentaire
+
+
+# Pour changer le statut d'une course
+class JobStatusUpdate(BaseModel):
+    status: Literal["pending", "in_progress", "done"]
+
+
+# job_id -> données de la course
+jobs: Dict[str, Dict] = {}
+
+
+@app.post("/jobs")
+def create_job(payload: NewJob):
+    """
+    Création d'une nouvelle course par la centrale.
+    Statut de départ : pending (en attente).
+    """
+    job_id = str(uuid4())
+
+    job_data = {
+        "id": job_id,
         "driver_id": payload.driver_id,
-        "customer_name": payload.customer_name,
-        "address": payload.address,
+        "client_name": payload.client_name,
+        "pickup_address": payload.pickup_address,
+        "dropoff_address": payload.dropoff_address,
         "phone": payload.phone,
-        "comment": payload.comment or "",
+        "comment": payload.comment,
+        "status": "pending", # en attente
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "status": "new",
-    }
-    jobs[payload.driver_id] = job
-    print("Nouvelle course :", job)
-    return {"ok": True}
-
-@app.get("/job/{driver_id}")
-def get_job(driver_id: str):
-    # Renvoie {"job": {...}} ou {"job": None}
-    return {"job": jobs.get(driver_id)}
-
-@app.post("/job/{driver_id}/status")
-def update_job_status(driver_id: str, payload: JobStatusUpdate):
-    if driver_id not in jobs:
-        raise HTTPException(status_code=404, detail="Aucune course pour ce chauffeur")
-    jobs[driver_id]["status"] = payload.status
-    # Si on met "done", on supprime la course
-    if payload.status == "done":
-        jobs.pop(driver_id, None)
-    return {"ok": True}
+        "updated_at": datetime.now(timezone.utc).

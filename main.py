@@ -1,89 +1,202 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from datetime import datetime, timezone
-from typing import Dict, List, Literal
-from uuid import uuid4
+from typing import List, Optional
+from datetime import datetime
+import sqlite3
+import uuid
 
-app = FastAPI()
+DB_PATH = "easytaxi.db"
 
-# ---------------------------
-# Modèle pour la position
-# ---------------------------
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS drivers (
+            id TEXT PRIMARY KEY,
+            latitude REAL,
+            longitude REAL,
+            status TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS jobs (
+            id TEXT PRIMARY KEY,
+            driver_id TEXT,
+            customer_name TEXT,
+            address TEXT,
+            phone TEXT,
+            comment TEXT,
+            created_at TEXT,
+            status TEXT
+        )
+        """
+    )
+
+    conn.commit()
+    conn.close()
+
+init_db()
 
 class UpdateLocation(BaseModel):
     driver_id: str
     latitude: float
     longitude: float
-    status: str # "online" / "offline" par ex.
+    status: str
 
-# driver_id -> données du chauffeur
-drivers: Dict[str, Dict] = {}
+class JobCreate(BaseModel):
+    driver_id: str
+    customer_name: str
+    address: str
+    phone: str
+    comment: Optional[str] = ""
 
+class JobStatusUpdate(BaseModel):
+    status: str
 
-@app.get("/")
-def root():
-    return {"status": "Server is running"}
+app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # pour les tests, on ouvre à tout
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -------------------------
+# Chauffeurs
+# -------------------------
 
 @app.post("/update-location")
-def update_location(payload: UpdateLocation):
-    drivers[payload.driver_id] = {
-        "id": payload.driver_id,
-        "latitude": payload.latitude,
-        "longitude": payload.longitude,
-        "status": payload.status,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    print("Nouvelles données :", drivers[payload.driver_id])
+def update_location(body: UpdateLocation):
+    conn = get_db()
+    cur = conn.cursor()
+
+    now = datetime.utcnow().isoformat()
+
+    cur.execute(
+        """
+        INSERT INTO drivers (id, latitude, longitude, status, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          latitude=excluded.latitude,
+          longitude=excluded.longitude,
+          status=excluded.status,
+          updated_at=excluded.updated_at
+        """,
+        (body.driver_id, body.latitude, body.longitude, body.status, now),
+    )
+
+    conn.commit()
+    conn.close()
     return {"ok": True}
 
-
 @app.get("/drivers")
-def get_drivers() -> List[Dict]:
-    """
-    Retourne la liste de TOUS les chauffeurs connectés.
-    """
-    return list(drivers.values())
+def list_drivers():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM drivers")
+    rows = cur.fetchall()
+    conn.close()
 
-# ---------------------------
-# Modèles pour les courses
-# ---------------------------
+    return [
+        {
+            "id": r["id"],
+            "latitude": r["latitude"],
+            "longitude": r["longitude"],
+            "status": r["status"],
+            "updated_at": r["updated_at"],
+        }
+        for r in rows
+    ]
 
-# Ce que la centrale envoie quand elle crée une course
-class NewJob(BaseModel):
-    driver_id: str # taxi01, taxi02, ...
-    client_name: str # Nom du client
-    pickup_address: str # Adresse de prise en charge
-    dropoff_address: str | None = None # Destination (optionnel)
-    phone: str | None = None # Téléphone client
-    comment: str | None = None # Commentaire
+# -------------------------
+# Courses
+# -------------------------
 
+@app.post("/send-job")
+def send_job(body: JobCreate):
+    conn = get_db()
+    cur = conn.cursor()
 
-# Pour changer le statut d'une course
-class JobStatusUpdate(BaseModel):
-    status: Literal["pending", "in_progress", "done"]
+    job_id = str(uuid.uuid4())
+    now = datetime.utcnow().isoformat()
 
+    cur.execute(
+        """
+        INSERT INTO jobs (
+            id, driver_id, customer_name, address, phone, comment, created_at, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            job_id,
+            body.driver_id,
+            body.customer_name,
+            body.address,
+            body.phone,
+            body.comment or "",
+            now,
+            "new",
+        ),
+    )
 
-# job_id -> données de la course
-jobs: Dict[str, Dict] = {}
+    conn.commit()
+    conn.close()
 
+    return {"ok": True, "job_id": job_id}
 
-@app.post("/jobs")
-def create_job(payload: NewJob):
-    """
-    Création d'une nouvelle course par la centrale.
-    Statut de départ : pending (en attente).
-    """
-    job_id = str(uuid4())
+@app.get("/jobs/{driver_id}")
+def get_jobs(driver_id: str):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM jobs WHERE driver_id = ? ORDER BY created_at DESC",
+        (driver_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
 
-    job_data = {
-        "id": job_id,
-        "driver_id": payload.driver_id,
-        "client_name": payload.client_name,
-        "pickup_address": payload.pickup_address,
-        "dropoff_address": payload.dropoff_address,
-        "phone": payload.phone,
-        "comment": payload.comment,
-        "status": "pending", # en attente
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "updated_at": datetime.now(timezone.utc).
+    return [
+        {
+            "id": r["id"],
+            "driver_id": r["driver_id"],
+            "customer_name": r["customer_name"],
+            "address": r["address"],
+            "phone": r["phone"],
+            "comment": r["comment"],
+            "created_at": r["created_at"],
+            "status": r["status"],
+        }
+        for r in rows
+    ]
+
+@app.post("/jobs/{job_id}/status")
+def update_job_status(job_id: str, body: JobStatusUpdate):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM jobs WHERE id = ?", (job_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    cur.execute(
+        "UPDATE jobs SET status = ? WHERE id = ?",
+        (body.status, job_id),
+    )
+    conn.commit()
+    conn.close()
+
+    return {"ok": True}

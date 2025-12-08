@@ -9,16 +9,18 @@ import requests
 
 DB_PATH = "easytaxi.db"
 
+
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
+
 def init_db():
     conn = get_db()
     cur = conn.cursor()
 
-    # Table chauffeurs
+    # ---------- Table chauffeurs ----------
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS drivers (
@@ -26,19 +28,13 @@ def init_db():
             latitude REAL,
             longitude REAL,
             status TEXT,
-            updated_at TEXT
+            updated_at TEXT,
+            expo_push_token TEXT
         )
         """
     )
 
-    # Rajouter la colonne pour le token si pas encore là
-    try:
-        cur.execute("ALTER TABLE drivers ADD COLUMN expo_push_token TEXT")
-    except Exception:
-        # colonne existe déjà -> on ignore
-        pass
-
-    # Table courses
+    # ---------- Table courses ----------
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS jobs (
@@ -54,18 +50,34 @@ def init_db():
         """
     )
 
+    # ---------- Table documents (bons scannés) ----------
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS documents (
+            id TEXT PRIMARY KEY,
+            driver_id TEXT,
+            title TEXT,
+            image_base64 TEXT,
+            created_at TEXT
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
+
 
 init_db()
 
 # ----------- MODELES -----------
+
 
 class UpdateLocation(BaseModel):
     driver_id: str
     latitude: float
     longitude: float
     status: str
+
 
 class JobCreate(BaseModel):
     driver_id: str
@@ -74,12 +86,21 @@ class JobCreate(BaseModel):
     phone: str
     comment: Optional[str] = ""
 
+
 class JobStatusUpdate(BaseModel):
     status: str
+
 
 class PushTokenRegister(BaseModel):
     driver_id: str
     expo_push_token: str
+
+
+class DocumentCreate(BaseModel):
+    driver_id: str
+    title: str
+    image_base64: str # image en base64 envoyée par le chauffeur
+
 
 # ----------- FASTAPI -----------
 
@@ -87,7 +108,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # pour ton usage, on ouvre tout
+    allow_origins=["*"], # on ouvre tout pour simplifier
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -115,6 +136,7 @@ def send_push_notification(token: str, title: str, body: str, data: dict | None 
 
 
 # ----------- ENDPOINTS CHAUFFEURS -----------
+
 
 @app.post("/update-location")
 def update_location(body: UpdateLocation):
@@ -187,6 +209,7 @@ def register_push_token(body: PushTokenRegister):
 
 
 # ----------- ENDPOINTS COURSES -----------
+
 
 @app.post("/send-job")
 def send_job(body: JobCreate):
@@ -282,3 +305,79 @@ def update_job_status(job_id: str, body: JobStatusUpdate):
 
     return {"ok": True}
 
+
+# ----------- ENDPOINTS DOCUMENTS (BON DE TRANSPORT) -----------
+
+
+@app.post("/documents")
+def upload_document(body: DocumentCreate):
+    """
+    Le chauffeur envoie un document scanné (photo en base64)
+    """
+    conn = get_db()
+    cur = conn.cursor()
+
+    doc_id = str(uuid.uuid4())
+    now = datetime.utcnow().isoformat()
+
+    cur.execute(
+        """
+        INSERT INTO documents (id, driver_id, title, image_base64, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (doc_id, body.driver_id, body.title, body.image_base64, now),
+    )
+
+    conn.commit()
+    conn.close()
+
+    return {"ok": True, "id": doc_id}
+
+
+@app.get("/documents/by-driver/{driver_id}")
+def list_documents_for_driver(driver_id: str):
+    """
+    Liste des documents pour un chauffeur (utilisé par l'app chauffeur)
+    """
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM documents WHERE driver_id = ? ORDER BY created_at DESC",
+        (driver_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    return [
+        {
+            "id": r["id"],
+            "driver_id": r["driver_id"],
+            "title": r["title"],
+            "image_base64": r["image_base64"],
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
+
+
+@app.get("/documents")
+def list_all_documents():
+    """
+    Liste de tous les documents (pour la centrale)
+    """
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM documents ORDER BY created_at DESC")
+    rows = cur.fetchall()
+    conn.close()
+
+    return [
+        {
+            "id": r["id"],
+            "driver_id": r["driver_id"],
+            "title": r["title"],
+            "image_base64": r["image_base64"],
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]

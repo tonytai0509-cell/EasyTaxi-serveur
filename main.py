@@ -1,13 +1,19 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime
 import sqlite3
 import uuid
 import requests
+import os
+from fastapi.responses import FileResponse
 
 DB_PATH = "easytaxi.db"
+UPLOAD_DIR = "uploads"
+
+# Assurer que le dossier d'upload existe
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
 def get_db():
@@ -20,7 +26,7 @@ def init_db():
     conn = get_db()
     cur = conn.cursor()
 
-    # ---------- Table chauffeurs ----------
+    # Table chauffeurs
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS drivers (
@@ -34,7 +40,7 @@ def init_db():
         """
     )
 
-    # ---------- Table courses ----------
+    # Table courses
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS jobs (
@@ -50,14 +56,15 @@ def init_db():
         """
     )
 
-    # ---------- Table documents (bons scannés) ----------
+    # Table documents
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS documents (
             id TEXT PRIMARY KEY,
             driver_id TEXT,
             title TEXT,
-            image_base64 TEXT,
+            filename TEXT,
+            original_name TEXT,
             created_at TEXT
         )
         """
@@ -70,7 +77,6 @@ def init_db():
 init_db()
 
 # ----------- MODELES -----------
-
 
 class UpdateLocation(BaseModel):
     driver_id: str
@@ -96,10 +102,12 @@ class PushTokenRegister(BaseModel):
     expo_push_token: str
 
 
-class DocumentCreate(BaseModel):
+class DocumentOut(BaseModel):
+    id: str
     driver_id: str
     title: str
-    image_base64: str # image en base64 envoyée par le chauffeur
+    created_at: str
+    original_name: str
 
 
 # ----------- FASTAPI -----------
@@ -108,7 +116,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # on ouvre tout pour simplifier
+    allow_origins=["*"], # pour ton usage, on ouvre tout
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -136,7 +144,6 @@ def send_push_notification(token: str, title: str, body: str, data: dict | None 
 
 
 # ----------- ENDPOINTS CHAUFFEURS -----------
-
 
 @app.post("/update-location")
 def update_location(body: UpdateLocation):
@@ -209,7 +216,6 @@ def register_push_token(body: PushTokenRegister):
 
 
 # ----------- ENDPOINTS COURSES -----------
-
 
 @app.post("/send-job")
 def send_job(body: JobCreate):
@@ -306,78 +312,106 @@ def update_job_status(job_id: str, body: JobStatusUpdate):
     return {"ok": True}
 
 
-# ----------- ENDPOINTS DOCUMENTS (BON DE TRANSPORT) -----------
+# ----------- ENDPOINTS DOCUMENTS -----------
 
-
-@app.post("/documents")
-def upload_document(body: DocumentCreate):
-    """
-    Le chauffeur envoie un document scanné (photo en base64)
-    """
-    conn = get_db()
-    cur = conn.cursor()
+@app.post("/documents/upload", response_model=DocumentOut)
+async def upload_document(
+    driver_id: str = Form(...),
+    title: str = Form(""),
+    file: UploadFile = File(...),
+):
+    # limiter aux pdf / images
+    if not (
+        file.content_type.startswith("image/")
+        or file.content_type == "application/pdf"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Format non supporté (seulement images ou PDF).",
+        )
 
     doc_id = str(uuid.uuid4())
+    _, ext = os.path.splitext(file.filename or "")
+    ext = ext or ".bin"
+    stored_name = f"{doc_id}{ext}"
+    path = os.path.join(UPLOAD_DIR, stored_name)
+
+    # sauvegarde fichier
+    with open(path, "wb") as f:
+        content = await file.read()
+        f.write(content)
+
     now = datetime.utcnow().isoformat()
 
+    conn = get_db()
+    cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO documents (id, driver_id, title, image_base64, created_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO documents (id, driver_id, title, filename, original_name, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (doc_id, body.driver_id, body.title, body.image_base64, now),
+        (doc_id, driver_id, title, stored_name, file.filename or "", now),
     )
-
     conn.commit()
     conn.close()
 
-    return {"ok": True, "id": doc_id}
-
-
-@app.get("/documents/by-driver/{driver_id}")
-def list_documents_for_driver(driver_id: str):
-    """
-    Liste des documents pour un chauffeur (utilisé par l'app chauffeur)
-    """
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT * FROM documents WHERE driver_id = ? ORDER BY created_at DESC",
-        (driver_id,),
+    return DocumentOut(
+        id=doc_id,
+        driver_id=driver_id,
+        title=title,
+        created_at=now,
+        original_name=file.filename or "",
     )
-    rows = cur.fetchall()
-    conn.close()
-
-    return [
-        {
-            "id": r["id"],
-            "driver_id": r["driver_id"],
-            "title": r["title"],
-            "image_base64": r["image_base64"],
-            "created_at": r["created_at"],
-        }
-        for r in rows
-    ]
 
 
-@app.get("/documents")
-def list_all_documents():
-    """
-    Liste de tous les documents (pour la centrale)
-    """
+@app.get("/documents", response_model=List[DocumentOut])
+def list_documents(driver_id: Optional[str] = None):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM documents ORDER BY created_at DESC")
+
+    if driver_id:
+        cur.execute(
+            "SELECT * FROM documents WHERE driver_id = ? ORDER BY created_at DESC",
+            (driver_id,),
+        )
+    else:
+        cur.execute(
+            "SELECT * FROM documents ORDER BY created_at DESC"
+        )
+
     rows = cur.fetchall()
     conn.close()
 
     return [
-        {
-            "id": r["id"],
-            "driver_id": r["driver_id"],
-            "title": r["title"],
-            "image_base64": r["image_base64"],
-            "created_at": r["created_at"],
-        }
+        DocumentOut(
+            id=r["id"],
+            driver_id=r["driver_id"],
+            title=r["title"],
+            created_at=r["created_at"],
+            original_name=r["original_name"],
+        )
         for r in rows
     ]
+
+
+@app.get("/documents/{doc_id}/download")
+def download_document(doc_id: str):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM documents WHERE id = ?", (doc_id,))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Document introuvable")
+
+    path = os.path.join(UPLOAD_DIR, row["filename"])
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Fichier manquant sur le serveur")
+
+    # on renvoie le fichier
+    return FileResponse(
+        path,
+        media_type="application/octet-stream",
+        filename=row["original_name"] or "document",
+    )

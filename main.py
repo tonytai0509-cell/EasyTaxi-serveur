@@ -215,10 +215,13 @@ def register_push_token(body: PushTokenRegister):
     return {"ok": True}
 
 
-# ----------- ENDPOINTS COURSES -----------
+# ----------- FONCTION INTERNE POUR CREER UNE COURSE -----------
 
-@app.post("/send-job")
-def send_job(body: JobCreate):
+def _create_job_and_notify(body: JobCreate) -> str:
+    """
+    Crée une course dans la base + envoie la notif push si le taxi a un token.
+    Retourne l'id de la course.
+    """
     conn = get_db()
     cur = conn.cursor()
 
@@ -261,6 +264,22 @@ def send_job(body: JobCreate):
             {"driver_id": body.driver_id, "job_id": job_id},
         )
 
+    return job_id
+
+
+# ----------- ENDPOINTS COURSES -----------
+
+# 💡 Nouveau endpoint utilisé par l'appli centrale
+@app.post("/jobs")
+def create_job(body: JobCreate):
+    job_id = _create_job_and_notify(body)
+    return {"ok": True, "job_id": job_id}
+
+
+# Ancien endpoint (toujours supporté si tu l’utilises ailleurs)
+@app.post("/send-job")
+def send_job(body: JobCreate):
+    job_id = _create_job_and_notify(body)
     return {"ok": True, "job_id": job_id}
 
 

@@ -343,23 +343,42 @@ def update_job_status(job_id: str, body: JobStatusUpdate):
 
 @app.post("/documents/upload", response_model=DocumentOut)
 async def upload_document(
-    driver_id: str = Form(...),
-    title: str = Form(""),
     file: UploadFile = File(...),
+    driver_id: str = Form("global"),
+    title: str = Form(""),
 ):
-    # limiter aux pdf / images
+    """
+    Upload d'un document partagé (image ou PDF).
+    - driver_id : "global" par défaut pour partage à tous.
+    - on accepte aussi 'application/octet-stream' (Android / Expo).
+    """
+    content_type = (file.content_type or "").lower()
+
     if not (
-        file.content_type.startswith("image/")
-        or file.content_type == "application/pdf"
+        content_type.startswith("image/")
+        or content_type == "application/pdf"
+        or content_type == "application/octet-stream"
     ):
         raise HTTPException(
             status_code=400,
-            detail="Format non supporté (seulement images ou PDF).",
+            detail=f"Format non supporté ({content_type})",
         )
+
+    # fallback driver_id
+    driver_id = (driver_id or "").strip()
+    if driver_id in ("", "undefined", "null"):
+        driver_id = "global"
 
     doc_id = str(uuid.uuid4())
     _, ext = os.path.splitext(file.filename or "")
-    ext = ext or ".bin"
+    if not ext:
+        if content_type.startswith("image/") or content_type == "application/octet-stream":
+            ext = ".jpg"
+        elif content_type == "application/pdf":
+            ext = ".pdf"
+        else:
+            ext = ".bin"
+
     stored_name = f"{doc_id}{ext}"
     path = os.path.join(UPLOAD_DIR, stored_name)
 

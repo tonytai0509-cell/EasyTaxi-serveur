@@ -56,7 +56,7 @@ def init_db():
         """
     )
 
-    # Table documents
+    # Table documents (partagés)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS documents (
@@ -110,13 +110,17 @@ class DocumentOut(BaseModel):
     original_name: str
 
 
+class DocumentRename(BaseModel):
+    title: Optional[str] = None
+
+
 # ----------- FASTAPI -----------
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # pour ton usage, on ouvre tout
+    allow_origins=["*"], # pour tes applis, on ouvre tout
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -271,14 +275,18 @@ def _create_job_and_notify(body: JobCreate) -> str:
 
 @app.post("/jobs")
 def create_job(body: JobCreate):
-  # utilisé par la centrale
+    """
+    Endpoint utilisé par la centrale pour envoyer une course.
+    """
     job_id = _create_job_and_notify(body)
     return {"ok": True, "job_id": job_id}
 
 
 @app.post("/send-job")
 def send_job(body: JobCreate):
-    # ancien endpoint, toujours supporté
+    """
+    Ancien endpoint (toujours supporté).
+    """
     job_id = _create_job_and_notify(body)
     return {"ok": True, "job_id": job_id}
 
@@ -331,16 +339,14 @@ def update_job_status(job_id: str, body: JobStatusUpdate):
     return {"ok": True}
 
 
-# ----------- FONCTION INTERNE POUR SAUVER UN DOCUMENT -----------
+# ----------- ENDPOINTS DOCUMENTS (PARTAGES) -----------
 
-async def _store_document(
-    driver_id: str,
-    title: str,
-    file: UploadFile,
-) -> DocumentOut:
-    if not driver_id:
-        raise HTTPException(status_code=400, detail="driver_id obligatoire.")
-
+@app.post("/documents/upload", response_model=DocumentOut)
+async def upload_document(
+    driver_id: str = Form(...),
+    title: str = Form(""),
+    file: UploadFile = File(...),
+):
     # limiter aux pdf / images
     if not (
         file.content_type.startswith("image/")
@@ -358,8 +364,8 @@ async def _store_document(
     path = os.path.join(UPLOAD_DIR, stored_name)
 
     # sauvegarde fichier
-    content = await file.read()
     with open(path, "wb") as f:
+        content = await file.read()
         f.write(content)
 
     now = datetime.utcnow().isoformat()
@@ -376,8 +382,6 @@ async def _store_document(
     conn.commit()
     conn.close()
 
-    print(f"[DOC] Nouveau document {doc_id} pour chauffeur {driver_id}")
-
     return DocumentOut(
         id=doc_id,
         driver_id=driver_id,
@@ -387,47 +391,14 @@ async def _store_document(
     )
 
 
-# ----------- ENDPOINTS DOCUMENTS -----------
-
-# Endpoint principal (recommandé)
-@app.post("/documents/upload", response_model=DocumentOut)
-async def upload_document(
-    driver_id: Optional[str] = Form(None),
-    driverId: Optional[str] = Form(None), # au cas où l'app envoie driverId
-    title: str = Form(""),
-    file: UploadFile = File(...),
-):
-    real_driver_id = (driver_id or driverId or "").strip()
-    return await _store_document(real_driver_id, title, file)
-
-
-# Endpoint alternatif si ton app fait POST sur /documents
-@app.post("/documents", response_model=DocumentOut)
-async def upload_document_legacy(
-    driver_id: Optional[str] = Form(None),
-    driverId: Optional[str] = Form(None),
-    title: str = Form(""),
-    file: UploadFile = File(...),
-):
-    real_driver_id = (driver_id or driverId or "").strip()
-    return await _store_document(real_driver_id, title, file)
-
-
 @app.get("/documents", response_model=List[DocumentOut])
-def list_documents(driver_id: Optional[str] = None):
+def list_documents():
+    """
+    Renvoie TOUS les documents (partagés pour tous : chauffeurs + centrale).
+    """
     conn = get_db()
     cur = conn.cursor()
-
-    if driver_id:
-        cur.execute(
-            "SELECT * FROM documents WHERE driver_id = ? ORDER BY created_at DESC",
-            (driver_id,),
-        )
-    else:
-        cur.execute(
-            "SELECT * FROM documents ORDER BY created_at DESC"
-        )
-
+    cur.execute("SELECT * FROM documents ORDER BY created_at DESC")
     rows = cur.fetchall()
     conn.close()
 
@@ -463,3 +434,66 @@ def download_document(doc_id: str):
         media_type="application/octet-stream",
         filename=row["original_name"] or "document",
     )
+
+
+@app.patch("/documents/{doc_id}", response_model=DocumentOut)
+def rename_document(doc_id: str, body: DocumentRename):
+    """
+    Renomme le document (champ title).
+    """
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM documents WHERE id = ?", (doc_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Document introuvable")
+
+    new_title = body.title if body.title is not None else row["title"]
+
+    cur.execute(
+        "UPDATE documents SET title = ? WHERE id = ?",
+        (new_title, doc_id),
+    )
+    conn.commit()
+
+    cur.execute("SELECT * FROM documents WHERE id = ?", (doc_id,))
+    updated = cur.fetchone()
+    conn.close()
+
+    return DocumentOut(
+        id=updated["id"],
+        driver_id=updated["driver_id"],
+        title=updated["title"],
+        created_at=updated["created_at"],
+        original_name=updated["original_name"],
+    )
+
+
+@app.delete("/documents/{doc_id}")
+def delete_document(doc_id: str):
+    """
+    Supprime un document (BDD + fichier).
+    """
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM documents WHERE id = ?", (doc_id,))
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Document introuvable")
+
+    path = os.path.join(UPLOAD_DIR, row["filename"])
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception as e:
+            print("Erreur suppression fichier :", e)
+
+    cur.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+    conn.commit()
+    conn.close()
+
+    return {"ok": True}

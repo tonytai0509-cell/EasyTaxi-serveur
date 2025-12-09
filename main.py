@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
@@ -7,7 +8,6 @@ import sqlite3
 import uuid
 import requests
 import os
-from fastapi.responses import FileResponse
 
 DB_PATH = "easytaxi.db"
 UPLOAD_DIR = "uploads"
@@ -125,9 +125,14 @@ app.add_middleware(
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
 
 
-def send_push_notification(token: str, title: str, body: str, data: dict | None = None):
+def send_push_notification(
+    token: str,
+    title: str,
+    body: str,
+    data: dict | None = None,
+):
     """
-    Envoie une notification push via Expo à un téléphone.
+    Envoie une notification push via Expo à un téléphone chauffeur.
     """
     payload = {
         "to": token,
@@ -147,6 +152,9 @@ def send_push_notification(token: str, title: str, body: str, data: dict | None 
 
 @app.post("/update-location")
 def update_location(body: UpdateLocation):
+    """
+    Appelée par l'app chauffeur toutes les X secondes avec sa position.
+    """
     conn = get_db()
     cur = conn.cursor()
 
@@ -172,6 +180,9 @@ def update_location(body: UpdateLocation):
 
 @app.get("/drivers")
 def list_drivers():
+    """
+    Utilisé par la centrale pour afficher les taxis sur la carte.
+    """
     conn = get_db()
     cur = conn.cursor()
     cur.execute("SELECT * FROM drivers")
@@ -219,7 +230,8 @@ def register_push_token(body: PushTokenRegister):
 
 def _create_job_and_notify(body: JobCreate) -> str:
     """
-    Crée une course dans la base + envoie la notif push si le taxi a un token.
+    Crée une course dans la base + envoie la notif push
+    si le chauffeur a un token Expo enregistré.
     Retourne l'id de la course.
     """
     conn = get_db()
@@ -269,14 +281,17 @@ def _create_job_and_notify(body: JobCreate) -> str:
 
 # ----------- ENDPOINTS COURSES -----------
 
-# 💡 Nouveau endpoint utilisé par l'appli centrale
 @app.post("/jobs")
 def create_job(body: JobCreate):
+    """
+    Endpoint principal utilisé par l'application centrale
+    pour créer une course.
+    """
     job_id = _create_job_and_notify(body)
     return {"ok": True, "job_id": job_id}
 
 
-# Ancien endpoint (toujours supporté si tu l’utilises ailleurs)
+# Ancien endpoint (toujours dispo si tu l'utilises)
 @app.post("/send-job")
 def send_job(body: JobCreate):
     job_id = _create_job_and_notify(body)
@@ -285,6 +300,9 @@ def send_job(body: JobCreate):
 
 @app.get("/jobs/{driver_id}")
 def get_jobs(driver_id: str):
+    """
+    Utilisé par l'app chauffeur pour récupérer ses courses.
+    """
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
@@ -311,6 +329,9 @@ def get_jobs(driver_id: str):
 
 @app.post("/jobs/{job_id}/status")
 def update_job_status(job_id: str, body: JobStatusUpdate):
+    """
+    Appelé par l'app chauffeur quand il accepte / termine la course.
+    """
     conn = get_db()
     cur = conn.cursor()
 
@@ -434,3 +455,11 @@ def download_document(doc_id: str):
         media_type="application/octet-stream",
         filename=row["original_name"] or "document",
     )
+
+
+@app.get("/health")
+def health():
+    """
+    Petit endpoint pour vérifier que le serveur tourne.
+    """
+    return {"status": "ok"}

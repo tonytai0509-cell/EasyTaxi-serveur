@@ -125,14 +125,9 @@ app.add_middleware(
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
 
 
-def send_push_notification(
-    token: str,
-    title: str,
-    body: str,
-    data: dict | None = None,
-):
+def send_push_notification(token: str, title: str, body: str, data: dict | None = None):
     """
-    Envoie une notification push via Expo à un téléphone chauffeur.
+    Envoie une notification push via Expo à un téléphone.
     """
     payload = {
         "to": token,
@@ -152,9 +147,6 @@ def send_push_notification(
 
 @app.post("/update-location")
 def update_location(body: UpdateLocation):
-    """
-    Appelée par l'app chauffeur toutes les X secondes avec sa position.
-    """
     conn = get_db()
     cur = conn.cursor()
 
@@ -180,9 +172,6 @@ def update_location(body: UpdateLocation):
 
 @app.get("/drivers")
 def list_drivers():
-    """
-    Utilisé par la centrale pour afficher les taxis sur la carte.
-    """
     conn = get_db()
     cur = conn.cursor()
     cur.execute("SELECT * FROM drivers")
@@ -230,8 +219,7 @@ def register_push_token(body: PushTokenRegister):
 
 def _create_job_and_notify(body: JobCreate) -> str:
     """
-    Crée une course dans la base + envoie la notif push
-    si le chauffeur a un token Expo enregistré.
+    Crée une course dans la base + envoie la notif push si le taxi a un token.
     Retourne l'id de la course.
     """
     conn = get_db()
@@ -283,26 +271,20 @@ def _create_job_and_notify(body: JobCreate) -> str:
 
 @app.post("/jobs")
 def create_job(body: JobCreate):
-    """
-    Endpoint principal utilisé par l'application centrale
-    pour créer une course.
-    """
+  # utilisé par la centrale
     job_id = _create_job_and_notify(body)
     return {"ok": True, "job_id": job_id}
 
 
-# Ancien endpoint (toujours dispo si tu l'utilises)
 @app.post("/send-job")
 def send_job(body: JobCreate):
+    # ancien endpoint, toujours supporté
     job_id = _create_job_and_notify(body)
     return {"ok": True, "job_id": job_id}
 
 
 @app.get("/jobs/{driver_id}")
 def get_jobs(driver_id: str):
-    """
-    Utilisé par l'app chauffeur pour récupérer ses courses.
-    """
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
@@ -329,9 +311,6 @@ def get_jobs(driver_id: str):
 
 @app.post("/jobs/{job_id}/status")
 def update_job_status(job_id: str, body: JobStatusUpdate):
-    """
-    Appelé par l'app chauffeur quand il accepte / termine la course.
-    """
     conn = get_db()
     cur = conn.cursor()
 
@@ -352,14 +331,16 @@ def update_job_status(job_id: str, body: JobStatusUpdate):
     return {"ok": True}
 
 
-# ----------- ENDPOINTS DOCUMENTS -----------
+# ----------- FONCTION INTERNE POUR SAUVER UN DOCUMENT -----------
 
-@app.post("/documents/upload", response_model=DocumentOut)
-async def upload_document(
-    driver_id: str = Form(...),
-    title: str = Form(""),
-    file: UploadFile = File(...),
-):
+async def _store_document(
+    driver_id: str,
+    title: str,
+    file: UploadFile,
+) -> DocumentOut:
+    if not driver_id:
+        raise HTTPException(status_code=400, detail="driver_id obligatoire.")
+
     # limiter aux pdf / images
     if not (
         file.content_type.startswith("image/")
@@ -377,8 +358,8 @@ async def upload_document(
     path = os.path.join(UPLOAD_DIR, stored_name)
 
     # sauvegarde fichier
+    content = await file.read()
     with open(path, "wb") as f:
-        content = await file.read()
         f.write(content)
 
     now = datetime.utcnow().isoformat()
@@ -395,6 +376,8 @@ async def upload_document(
     conn.commit()
     conn.close()
 
+    print(f"[DOC] Nouveau document {doc_id} pour chauffeur {driver_id}")
+
     return DocumentOut(
         id=doc_id,
         driver_id=driver_id,
@@ -402,6 +385,32 @@ async def upload_document(
         created_at=now,
         original_name=file.filename or "",
     )
+
+
+# ----------- ENDPOINTS DOCUMENTS -----------
+
+# Endpoint principal (recommandé)
+@app.post("/documents/upload", response_model=DocumentOut)
+async def upload_document(
+    driver_id: Optional[str] = Form(None),
+    driverId: Optional[str] = Form(None), # au cas où l'app envoie driverId
+    title: str = Form(""),
+    file: UploadFile = File(...),
+):
+    real_driver_id = (driver_id or driverId or "").strip()
+    return await _store_document(real_driver_id, title, file)
+
+
+# Endpoint alternatif si ton app fait POST sur /documents
+@app.post("/documents", response_model=DocumentOut)
+async def upload_document_legacy(
+    driver_id: Optional[str] = Form(None),
+    driverId: Optional[str] = Form(None),
+    title: str = Form(""),
+    file: UploadFile = File(...),
+):
+    real_driver_id = (driver_id or driverId or "").strip()
+    return await _store_document(real_driver_id, title, file)
 
 
 @app.get("/documents", response_model=List[DocumentOut])
@@ -449,17 +458,8 @@ def download_document(doc_id: str):
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Fichier manquant sur le serveur")
 
-    # on renvoie le fichier
     return FileResponse(
         path,
         media_type="application/octet-stream",
         filename=row["original_name"] or "document",
     )
-
-
-@app.get("/health")
-def health():
-    """
-    Petit endpoint pour vérifier que le serveur tourne.
-    """
-    return {"status": "ok"}

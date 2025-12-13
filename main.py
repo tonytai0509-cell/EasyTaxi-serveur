@@ -339,6 +339,29 @@ def update_job_status(job_id: str, body: JobStatusUpdate):
     return {"ok": True}
 
 
+# ✅ NOUVEAU : suppression réelle d'une course (BDD)
+@app.delete("/jobs/{job_id}")
+def delete_job(job_id: str):
+    """
+    Supprime une course (BDD).
+    IMPORTANT : nécessaire sinon l'app chauffeur la reverra à chaque refresh.
+    """
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT id FROM jobs WHERE id = ?", (job_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    cur.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+    conn.commit()
+    conn.close()
+
+    return {"ok": True}
+
+
 # ----------- ENDPOINTS DOCUMENTS (PARTAGES) -----------
 
 @app.post("/documents/upload", response_model=DocumentOut)
@@ -516,3 +539,4 @@ def delete_document(doc_id: str):
     conn.close()
 
     return {"ok": True}
+Nouveau

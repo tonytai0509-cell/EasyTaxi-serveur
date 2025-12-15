@@ -1,20 +1,24 @@
+from __future__ import annotations
+
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
-from typing import Optional, List
-from datetime import datetime
+from pydantic import BaseModel, Field
+from typing import Optional, List, Any
+from datetime import datetime, timedelta, timezone
 import sqlite3
 import uuid
 import requests
 import os
+import math
 
 DB_PATH = "easytaxi.db"
 UPLOAD_DIR = "uploads"
-
-# Assurer que le dossier d'upload existe
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
+
+# ---------------- DB ----------------
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -22,11 +26,20 @@ def get_db():
     return conn
 
 
+def _try_add_column(cur: sqlite3.Cursor, table: str, column_def: str):
+    # column_def example: "pickup_lat REAL"
+    try:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column_def}")
+    except sqlite3.OperationalError:
+        # column already exists (or table missing)
+        pass
+
+
 def init_db():
     conn = get_db()
     cur = conn.cursor()
 
-    # Table chauffeurs
+    # Drivers
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS drivers (
@@ -40,7 +53,7 @@ def init_db():
         """
     )
 
-    # Table courses
+    # Jobs
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS jobs (
@@ -56,7 +69,11 @@ def init_db():
         """
     )
 
-    # Table documents (partagés)
+    # Add missing columns if DB existed before (migration safe)
+    _try_add_column(cur, "jobs", "pickup_lat REAL")
+    _try_add_column(cur, "jobs", "pickup_lng REAL")
+
+    # Documents
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS documents (
@@ -76,7 +93,96 @@ def init_db():
 
 init_db()
 
-# ----------- MODELES -----------
+# ---------------- Utils ----------------
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def parse_iso(dt_str: str | None) -> Optional[datetime]:
+    if not dt_str:
+        return None
+    try:
+        # handles "2025-12-15T20:32:18.708Z" or "...+00:00"
+        s = dt_str.replace("Z", "+00:00")
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    # distance in meters
+    R = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def send_push_notification(token: str, title: str, body: str, data: dict | None = None):
+    payload = {
+        "to": token,
+        "sound": "default",
+        "title": title,
+        "body": body,
+        "data": data or {},
+    }
+    try:
+        resp = requests.post(EXPO_PUSH_URL, json=payload, timeout=8)
+        print("Expo push resp:", resp.status_code, resp.text)
+    except Exception as e:
+        print("Erreur envoi push :", e)
+
+
+def choose_nearest_online_driver(pickup_lat: float, pickup_lng: float, max_age_seconds: int = 180) -> Optional[str]:
+    """
+    Retourne l'id du chauffeur ONLINE le plus proche.
+    max_age_seconds : on ignore les chauffeurs qui n'ont pas envoyé de position récemment.
+    """
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, latitude, longitude, status, updated_at FROM drivers")
+    rows = cur.fetchall()
+    conn.close()
+
+    now = datetime.now(timezone.utc)
+
+    best_id = None
+    best_dist = None
+
+    for r in rows:
+        status = (r["status"] or "").lower()
+        if status != "online":
+            continue
+
+        lat = r["latitude"]
+        lng = r["longitude"]
+        if lat is None or lng is None:
+            continue
+
+        updated_at = parse_iso(r["updated_at"])
+        if not updated_at:
+            continue
+
+        # ensure timezone-aware
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+
+        age = (now - updated_at).total_seconds()
+        if age > max_age_seconds:
+            continue
+
+        d = haversine_m(pickup_lat, pickup_lng, float(lat), float(lng))
+        if best_dist is None or d < best_dist:
+            best_dist = d
+            best_id = r["id"]
+
+    return best_id
+
+
+# ---------------- Models ----------------
 
 class UpdateLocation(BaseModel):
     driver_id: str
@@ -85,21 +191,31 @@ class UpdateLocation(BaseModel):
     status: str
 
 
-class JobCreate(BaseModel):
+class PushTokenRegister(BaseModel):
     driver_id: str
+    expo_push_token: str
+
+
+class JobCreate(BaseModel):
+    # ✅ supporte driver_id OU chosen_driver_id (alias venant de la centrale)
+    driver_id: Optional[str] = None
+    chosen_driver_id: Optional[str] = Field(default=None)
+
     customer_name: str
     address: str
     phone: str
     comment: Optional[str] = ""
 
+    # ✅ coordonnées départ (pour choisir le plus proche)
+    pickup_lat: Optional[float] = None
+    pickup_lng: Optional[float] = None
+
+    # optionnel, on ignore si fourni
+    created_at: Optional[str] = None
+
 
 class JobStatusUpdate(BaseModel):
     status: str
-
-
-class PushTokenRegister(BaseModel):
-    driver_id: str
-    expo_push_token: str
 
 
 class DocumentOut(BaseModel):
@@ -114,47 +230,26 @@ class DocumentRename(BaseModel):
     title: Optional[str] = None
 
 
-# ----------- FASTAPI -----------
+# ---------------- FastAPI ----------------
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # pour tes applis, on ouvre tout
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
-
-
-def send_push_notification(token: str, title: str, body: str, data: dict | None = None):
-    """
-    Envoie une notification push via Expo à un téléphone.
-    """
-    payload = {
-        "to": token,
-        "sound": "default",
-        "title": title,
-        "body": body,
-        "data": data or {},
-    }
-    try:
-        resp = requests.post(EXPO_PUSH_URL, json=payload, timeout=5)
-        print("Expo push resp:", resp.status_code, resp.text)
-    except Exception as e:
-        print("Erreur envoi push :", e)
-
-
-# ----------- ENDPOINTS CHAUFFEURS -----------
+# ---------------- Drivers endpoints ----------------
 
 @app.post("/update-location")
 def update_location(body: UpdateLocation):
     conn = get_db()
     cur = conn.cursor()
 
-    now = datetime.utcnow().isoformat()
+    now = utc_now_iso()
 
     cur.execute(
         """
@@ -196,13 +291,9 @@ def list_drivers():
 
 @app.post("/register-push-token")
 def register_push_token(body: PushTokenRegister):
-    """
-    Appelé par l'app chauffeur :
-    - enregistre le token Expo dans la table drivers
-    """
     conn = get_db()
     cur = conn.cursor()
-    now = datetime.utcnow().isoformat()
+    now = utc_now_iso()
 
     cur.execute(
         """
@@ -218,77 +309,93 @@ def register_push_token(body: PushTokenRegister):
     conn.close()
     return {"ok": True}
 
+# ---------------- Jobs internals ----------------
 
-# ----------- FONCTION INTERNE POUR CREER UNE COURSE -----------
+def _resolve_driver_id(body: JobCreate) -> str:
+    """
+    Ordre de priorité :
+    1) chosen_driver_id
+    2) driver_id
+    3) nearest online driver (si pickup_lat/pickup_lng fournis)
+    """
+    chosen = (body.chosen_driver_id or "").strip()
+    if chosen:
+        return chosen
 
-def _create_job_and_notify(body: JobCreate) -> str:
-    """
-    Crée une course dans la base + envoie la notif push si le taxi a un token.
-    Retourne l'id de la course.
-    """
+    direct = (body.driver_id or "").strip()
+    if direct:
+        return direct
+
+    if body.pickup_lat is not None and body.pickup_lng is not None:
+        nearest = choose_nearest_online_driver(body.pickup_lat, body.pickup_lng)
+        if nearest:
+            return nearest
+
+    raise HTTPException(
+        status_code=422,
+        detail="Aucun driver_id/chosen_driver_id fourni, et impossible de choisir un chauffeur (pickup_lat/pickup_lng manquants ou aucun chauffeur online récent)."
+    )
+
+
+def _create_job_and_notify(body: JobCreate) -> dict:
+    driver_id = _resolve_driver_id(body)
+
     conn = get_db()
     cur = conn.cursor()
 
     job_id = str(uuid.uuid4())
-    now = datetime.utcnow().isoformat()
+    now = utc_now_iso()
 
     cur.execute(
         """
         INSERT INTO jobs (
-            id, driver_id, customer_name, address, phone, comment, created_at, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            id, driver_id, customer_name, address, phone, comment, created_at, status, pickup_lat, pickup_lng
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             job_id,
-            body.driver_id,
+            driver_id,
             body.customer_name,
             body.address,
             body.phone,
             body.comment or "",
             now,
             "new",
+            body.pickup_lat,
+            body.pickup_lng,
         ),
     )
 
-    # récupérer expo_push_token du chauffeur
-    cur.execute(
-        "SELECT expo_push_token FROM drivers WHERE id = ?",
-        (body.driver_id,),
-    )
+    # token push du chauffeur
+    cur.execute("SELECT expo_push_token FROM drivers WHERE id = ?", (driver_id,))
     row = cur.fetchone()
+
     conn.commit()
     conn.close()
 
-    # si on a un token, on envoie une notification
     if row and row["expo_push_token"]:
         send_push_notification(
             row["expo_push_token"],
             "Nouvelle course",
             f"{body.customer_name} - {body.address}",
-            {"driver_id": body.driver_id, "job_id": job_id},
+            {"driver_id": driver_id, "job_id": job_id},
         )
 
-    return job_id
+    return {"job_id": job_id, "assigned_driver_id": driver_id}
 
-
-# ----------- ENDPOINTS COURSES -----------
+# ---------------- Jobs endpoints ----------------
 
 @app.post("/jobs")
 def create_job(body: JobCreate):
-    """
-    Endpoint utilisé par la centrale pour envoyer une course.
-    """
-    job_id = _create_job_and_notify(body)
-    return {"ok": True, "job_id": job_id}
+    result = _create_job_and_notify(body)
+    return {"ok": True, **result}
 
 
 @app.post("/send-job")
 def send_job(body: JobCreate):
-    """
-    Ancien endpoint (toujours supporté).
-    """
-    job_id = _create_job_and_notify(body)
-    return {"ok": True, "job_id": job_id}
+    # ancien endpoint conservé
+    result = _create_job_and_notify(body)
+    return {"ok": True, **result}
 
 
 @app.get("/jobs/{driver_id}")
@@ -312,6 +419,8 @@ def get_jobs(driver_id: str):
             "comment": r["comment"],
             "created_at": r["created_at"],
             "status": r["status"],
+            "pickup_lat": r["pickup_lat"],
+            "pickup_lng": r["pickup_lng"],
         }
         for r in rows
     ]
@@ -328,24 +437,14 @@ def update_job_status(job_id: str, body: JobStatusUpdate):
         conn.close()
         raise HTTPException(status_code=404, detail="Job not found")
 
-    cur.execute(
-        "UPDATE jobs SET status = ? WHERE id = ?",
-        (body.status, job_id),
-    )
-
+    cur.execute("UPDATE jobs SET status = ? WHERE id = ?", (body.status, job_id))
     conn.commit()
     conn.close()
-
     return {"ok": True}
 
 
-# ✅ NOUVEAU : suppression réelle d'une course (BDD)
 @app.delete("/jobs/{job_id}")
 def delete_job(job_id: str):
-    """
-    Supprime une course (BDD).
-    IMPORTANT : nécessaire sinon l'app chauffeur la reverra à chaque refresh.
-    """
     conn = get_db()
     cur = conn.cursor()
 
@@ -358,11 +457,9 @@ def delete_job(job_id: str):
     cur.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
     conn.commit()
     conn.close()
-
     return {"ok": True}
 
-
-# ----------- ENDPOINTS DOCUMENTS (PARTAGES) -----------
+# ---------------- Documents endpoints ----------------
 
 @app.post("/documents/upload", response_model=DocumentOut)
 async def upload_document(
@@ -370,11 +467,6 @@ async def upload_document(
     driver_id: str = Form("global"),
     title: str = Form(""),
 ):
-    """
-    Upload d'un document partagé (image ou PDF).
-    - driver_id : "global" par défaut pour partage à tous.
-    - on accepte aussi 'application/octet-stream' (Android / Expo).
-    """
     content_type = (file.content_type or "").lower()
 
     if not (
@@ -382,12 +474,8 @@ async def upload_document(
         or content_type == "application/pdf"
         or content_type == "application/octet-stream"
     ):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Format non supporté ({content_type})",
-        )
+        raise HTTPException(status_code=400, detail=f"Format non supporté ({content_type})")
 
-    # fallback driver_id
     driver_id = (driver_id or "").strip()
     if driver_id in ("", "undefined", "null"):
         driver_id = "global"
@@ -405,12 +493,11 @@ async def upload_document(
     stored_name = f"{doc_id}{ext}"
     path = os.path.join(UPLOAD_DIR, stored_name)
 
-    # sauvegarde fichier
     with open(path, "wb") as f:
         content = await file.read()
         f.write(content)
 
-    now = datetime.utcnow().isoformat()
+    now = utc_now_iso()
 
     conn = get_db()
     cur = conn.cursor()
@@ -435,9 +522,6 @@ async def upload_document(
 
 @app.get("/documents", response_model=List[DocumentOut])
 def list_documents():
-    """
-    Renvoie TOUS les documents (partagés pour tous : chauffeurs + centrale).
-    """
     conn = get_db()
     cur = conn.cursor()
     cur.execute("SELECT * FROM documents ORDER BY created_at DESC")
@@ -480,9 +564,6 @@ def download_document(doc_id: str):
 
 @app.patch("/documents/{doc_id}", response_model=DocumentOut)
 def rename_document(doc_id: str, body: DocumentRename):
-    """
-    Renomme le document (champ title).
-    """
     conn = get_db()
     cur = conn.cursor()
 
@@ -494,10 +575,7 @@ def rename_document(doc_id: str, body: DocumentRename):
 
     new_title = body.title if body.title is not None else row["title"]
 
-    cur.execute(
-        "UPDATE documents SET title = ? WHERE id = ?",
-        (new_title, doc_id),
-    )
+    cur.execute("UPDATE documents SET title = ? WHERE id = ?", (new_title, doc_id))
     conn.commit()
 
     cur.execute("SELECT * FROM documents WHERE id = ?", (doc_id,))
@@ -515,9 +593,6 @@ def rename_document(doc_id: str, body: DocumentRename):
 
 @app.delete("/documents/{doc_id}")
 def delete_document(doc_id: str):
-    """
-    Supprime un document (BDD + fichier).
-    """
     conn = get_db()
     cur = conn.cursor()
     cur.execute("SELECT * FROM documents WHERE id = ?", (doc_id,))
@@ -539,4 +614,3 @@ def delete_document(doc_id: str):
     conn.close()
 
     return {"ok": True}
-

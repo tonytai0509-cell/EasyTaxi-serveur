@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional, List
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 import sqlite3
 import uuid
 import requests
@@ -14,19 +14,15 @@ DB_PATH = "easytaxi.db"
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# ---------------- DB ----------------
-
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
-def _safe_add_column(cur, table: str, column: str, coltype: str):
-    # Ajoute une colonne si elle n'existe pas (SQLite)
+def column_exists(cur, table: str, col: str) -> bool:
     cur.execute(f"PRAGMA table_info({table})")
-    cols = [r[1] for r in cur.fetchall()]
-    if column not in cols:
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+    cols = [r["name"] for r in cur.fetchall()]
+    return col in cols
 
 def init_db():
     conn = get_db()
@@ -62,9 +58,11 @@ def init_db():
         """
     )
 
-    # ✅ Ajout colonnes pickup (si pas déjà là)
-    _safe_add_column(cur, "jobs", "pickup_lat", "REAL")
-    _safe_add_column(cur, "jobs", "pickup_lng", "REAL")
+    # ✅ MIGRATION : ajoute pickup_lat/pickup_lng si manquants
+    if not column_exists(cur, "jobs", "pickup_lat"):
+        cur.execute("ALTER TABLE jobs ADD COLUMN pickup_lat REAL")
+    if not column_exists(cur, "jobs", "pickup_lng"):
+        cur.execute("ALTER TABLE jobs ADD COLUMN pickup_lng REAL")
 
     # Table documents (partagés)
     cur.execute(
@@ -85,35 +83,33 @@ def init_db():
 
 init_db()
 
-# ---------------- MODELES ----------------
+# ----------- MODELES -----------
 
 class UpdateLocation(BaseModel):
     driver_id: str
     latitude: float
     longitude: float
-    status: str # "online" / "offline"
+    status: str
 
 class JobCreate(BaseModel):
-    # ⚠️ utilisé pour envoi manuel (chauffeur choisi)
     driver_id: str
     customer_name: str
     address: str
     phone: str
     comment: Optional[str] = ""
-    pickup_lat: Optional[float] = None
-    pickup_lng: Optional[float] = None
 
-class JobCreateAuto(BaseModel):
-    # ✅ utilisé pour envoi auto (plus proche)
+class AutoJobCreate(BaseModel):
+    pickup_lat: float
+    pickup_lng: float
     customer_name: str
     address: str
     phone: str
     comment: Optional[str] = ""
-    pickup_lat: float
-    pickup_lng: float
+    max_age_sec: Optional[int] = 120 # un chauffeur est "valide" si position < 120s
+    max_radius_km: Optional[float] = 50.0 # optionnel
 
 class JobStatusUpdate(BaseModel):
-    status: str # "new" | "accepted" | "done"
+    status: str
 
 class PushTokenRegister(BaseModel):
     driver_id: str
@@ -129,10 +125,9 @@ class DocumentOut(BaseModel):
 class DocumentRename(BaseModel):
     title: Optional[str] = None
 
-# ---------------- FASTAPI ----------------
+# ----------- FASTAPI -----------
 
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -152,41 +147,37 @@ def send_push_notification(token: str, title: str, body: str, data: dict | None 
         "data": data or {},
     }
     try:
-        resp = requests.post(EXPO_PUSH_URL, json=payload, timeout=8)
+        resp = requests.post(EXPO_PUSH_URL, json=payload, timeout=5)
         print("Expo push resp:", resp.status_code, resp.text)
     except Exception as e:
         print("Erreur envoi push :", e)
 
-# ---------------- UTILS DISTANCE ----------------
+# ----------- UTILS DISTANCE -----------
 
 def haversine_km(lat1, lon1, lat2, lon2) -> float:
-    # Distance en km entre 2 points
     R = 6371.0
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat/2)**2 + math.cos(p1) * math.cos(p2) * math.sin(dlon/2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-    return R * c
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dl/2)**2
+    return 2 * R * math.asin(math.sqrt(a))
 
-def parse_iso(iso: str) -> Optional[datetime]:
-    if not iso:
-        return None
+def parse_iso(dt_str: str) -> Optional[datetime]:
     try:
-        # ex: "2025-12-15T20:32:18.708Z" ou sans Z
-        s = iso.replace("Z", "+00:00")
+        # isoformat utc sans Z aussi
+        s = dt_str.replace("Z", "")
         return datetime.fromisoformat(s)
     except:
         return None
 
-# ---------------- ENDPOINTS CHAUFFEURS ----------------
+# ----------- ENDPOINTS CHAUFFEURS -----------
 
 @app.post("/update-location")
 def update_location(body: UpdateLocation):
     conn = get_db()
     cur = conn.cursor()
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.utcnow().isoformat()
 
     cur.execute(
         """
@@ -228,7 +219,7 @@ def list_drivers():
 def register_push_token(body: PushTokenRegister):
     conn = get_db()
     cur = conn.cursor()
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.utcnow().isoformat()
 
     cur.execute(
         """
@@ -244,22 +235,15 @@ def register_push_token(body: PushTokenRegister):
     conn.close()
     return {"ok": True}
 
-# ---------------- INTERNAL JOB CREATE ----------------
+# ----------- FONCTION INTERNE POUR CREER UNE COURSE -----------
 
-def _create_job_and_notify(
-    driver_id: str,
-    customer_name: str,
-    address: str,
-    phone: str,
-    comment: str,
-    pickup_lat: Optional[float],
-    pickup_lng: Optional[float],
-) -> str:
+def _create_job_and_notify(driver_id: str, customer_name: str, address: str, phone: str, comment: str,
+                           pickup_lat: Optional[float] = None, pickup_lng: Optional[float] = None) -> str:
     conn = get_db()
     cur = conn.cursor()
 
     job_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.utcnow().isoformat()
 
     cur.execute(
         """
@@ -296,109 +280,94 @@ def _create_job_and_notify(
 
     return job_id
 
-def _pick_nearest_driver(pickup_lat: float, pickup_lng: float) -> tuple[str, float]:
-    """
-    Choisit le chauffeur ONLINE le + proche, parmi ceux "récents".
-    """
+def _pick_nearest_online_driver(pickup_lat: float, pickup_lng: float, max_age_sec: int, max_radius_km: float):
     conn = get_db()
     cur = conn.cursor()
-
     cur.execute("SELECT * FROM drivers WHERE status = 'online'")
     rows = cur.fetchall()
     conn.close()
 
-    if not rows:
-        raise HTTPException(status_code=409, detail="Aucun chauffeur en ligne")
-
-    now = datetime.now(timezone.utc)
-    best_id = None
-    best_km = None
+    now = datetime.utcnow()
+    best = None
 
     for r in rows:
         lat = r["latitude"]
         lng = r["longitude"]
-        upd = parse_iso(r["updated_at"])
-
-        # ignore positions invalides
         if lat is None or lng is None:
             continue
-        if float(lat) == 0 and float(lng) == 0:
+
+        dt = parse_iso(r["updated_at"] or "")
+        if not dt:
+            continue
+        if (now - dt) > timedelta(seconds=max_age_sec):
             continue
 
-        # ignore trop vieux (ex: > 90 sec)
-        if upd:
-            age = (now - upd).total_seconds()
-            if age > 90:
-                continue
-
         d = haversine_km(pickup_lat, pickup_lng, float(lat), float(lng))
-        if best_km is None or d < best_km:
-            best_km = d
-            best_id = r["id"]
+        if d > max_radius_km:
+            continue
 
-    if not best_id:
-        raise HTTPException(status_code=409, detail="Aucun chauffeur ONLINE avec position récente")
+        if best is None or d < best["distance_km"]:
+            best = {
+                "driver_id": r["id"],
+                "distance_km": d,
+                "driver_lat": float(lat),
+                "driver_lng": float(lng),
+                "updated_at": r["updated_at"],
+            }
 
-    return best_id, float(best_km)
+    return best
 
-# ---------------- ENDPOINTS COURSES ----------------
+# ----------- ENDPOINTS COURSES -----------
 
 @app.post("/jobs")
 def create_job(body: JobCreate):
     job_id = _create_job_and_notify(
-        body.driver_id,
-        body.customer_name,
-        body.address,
-        body.phone,
-        body.comment or "",
-        body.pickup_lat,
-        body.pickup_lng,
+        body.driver_id, body.customer_name, body.address, body.phone, body.comment or ""
     )
     return {"ok": True, "job_id": job_id}
 
 @app.post("/send-job")
 def send_job(body: JobCreate):
     job_id = _create_job_and_notify(
-        body.driver_id,
-        body.customer_name,
-        body.address,
-        body.phone,
-        body.comment or "",
-        body.pickup_lat,
-        body.pickup_lng,
+        body.driver_id, body.customer_name, body.address, body.phone, body.comment or ""
     )
     return {"ok": True, "job_id": job_id}
 
-# ✅ NOUVEAU : ENVOI AUTO (plus proche)
-@app.post("/send-job/auto")
-def send_job_auto(body: JobCreateAuto):
-    driver_id, km = _pick_nearest_driver(body.pickup_lat, body.pickup_lng)
+# ✅ NOUVEAU : envoi auto au plus proche
+@app.post("/send-job-auto")
+def send_job_auto(body: AutoJobCreate):
+    pick = _pick_nearest_online_driver(
+        pickup_lat=body.pickup_lat,
+        pickup_lng=body.pickup_lng,
+        max_age_sec=body.max_age_sec or 120,
+        max_radius_km=body.max_radius_km or 50.0,
+    )
+    if not pick:
+        raise HTTPException(status_code=404, detail="Aucun chauffeur online proche (position trop ancienne ou trop loin).")
 
     job_id = _create_job_and_notify(
-        driver_id,
-        body.customer_name,
-        body.address,
-        body.phone,
-        body.comment or "",
-        body.pickup_lat,
-        body.pickup_lng,
+        driver_id=pick["driver_id"],
+        customer_name=body.customer_name,
+        address=body.address,
+        phone=body.phone,
+        comment=body.comment or "",
+        pickup_lat=body.pickup_lat,
+        pickup_lng=body.pickup_lng,
     )
 
     return {
         "ok": True,
         "job_id": job_id,
-        "driver_id": driver_id,
-        "distance_km": round(km, 3),
+        "chosen_driver_id": pick["driver_id"],
+        "distance_km": round(pick["distance_km"], 3),
+        "driver_updated_at": pick["updated_at"],
     }
 
 @app.get("/jobs/{driver_id}")
 def get_jobs(driver_id: str):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute(
-        "SELECT * FROM jobs WHERE driver_id = ? ORDER BY created_at DESC",
-        (driver_id,),
-    )
+    cur.execute("SELECT * FROM jobs WHERE driver_id = ? ORDER BY created_at DESC", (driver_id,))
     rows = cur.fetchall()
     conn.close()
 
@@ -450,7 +419,7 @@ def delete_job(job_id: str):
     conn.close()
     return {"ok": True}
 
-# ---------------- DOCUMENTS ----------------
+# ----------- ENDPOINTS DOCUMENTS (PARTAGES) -----------
 
 @app.post("/documents/upload", response_model=DocumentOut)
 async def upload_document(
@@ -488,7 +457,7 @@ async def upload_document(
         content = await file.read()
         f.write(content)
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.utcnow().isoformat()
 
     conn = get_db()
     cur = conn.cursor()
@@ -502,13 +471,7 @@ async def upload_document(
     conn.commit()
     conn.close()
 
-    return DocumentOut(
-        id=doc_id,
-        driver_id=driver_id,
-        title=title,
-        created_at=now,
-        original_name=file.filename or "",
-    )
+    return DocumentOut(id=doc_id, driver_id=driver_id, title=title, created_at=now, original_name=file.filename or "")
 
 @app.get("/documents", response_model=List[DocumentOut])
 def list_documents():
@@ -562,7 +525,6 @@ def rename_document(doc_id: str, body: DocumentRename):
         raise HTTPException(status_code=404, detail="Document introuvable")
 
     new_title = body.title if body.title is not None else row["title"]
-
     cur.execute("UPDATE documents SET title = ? WHERE id = ?", (new_title, doc_id))
     conn.commit()
 

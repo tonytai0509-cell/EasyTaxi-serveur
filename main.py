@@ -1,24 +1,21 @@
-from __future__ import annotations
-
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
-from typing import Optional, List, Any
-from datetime import datetime, timedelta, timezone
+from pydantic import BaseModel
+from typing import Optional, List
+from datetime import datetime, timedelta
 import sqlite3
 import uuid
 import requests
 import os
+import json
 import math
+import asyncio
 
 DB_PATH = "easytaxi.db"
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
-
-# ---------------- DB ----------------
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -26,12 +23,10 @@ def get_db():
     return conn
 
 
-def _try_add_column(cur: sqlite3.Cursor, table: str, column_def: str):
-    # column_def example: "pickup_lat REAL"
+def _safe_alter(cur, sql: str):
     try:
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column_def}")
-    except sqlite3.OperationalError:
-        # column already exists (or table missing)
+        cur.execute(sql)
+    except Exception:
         pass
 
 
@@ -39,7 +34,7 @@ def init_db():
     conn = get_db()
     cur = conn.cursor()
 
-    # Drivers
+    # Table chauffeurs
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS drivers (
@@ -53,7 +48,7 @@ def init_db():
         """
     )
 
-    # Jobs
+    # Table courses (jobs)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS jobs (
@@ -69,11 +64,15 @@ def init_db():
         """
     )
 
-    # Add missing columns if DB existed before (migration safe)
-    _try_add_column(cur, "jobs", "pickup_lat REAL")
-    _try_add_column(cur, "jobs", "pickup_lng REAL")
+    # Ajout colonnes pour la "proposition en cascade"
+    _safe_alter(cur, "ALTER TABLE jobs ADD COLUMN pickup_lat REAL")
+    _safe_alter(cur, "ALTER TABLE jobs ADD COLUMN pickup_lng REAL")
+    _safe_alter(cur, "ALTER TABLE jobs ADD COLUMN offered_queue TEXT") # JSON array driver_ids
+    _safe_alter(cur, "ALTER TABLE jobs ADD COLUMN offer_index INTEGER") # index dans la queue
+    _safe_alter(cur, "ALTER TABLE jobs ADD COLUMN current_offer_driver TEXT") # driver_id proposé actuellement
+    _safe_alter(cur, "ALTER TABLE jobs ADD COLUMN offer_expires_at TEXT") # ISO UTC
 
-    # Documents
+    # Table documents
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS documents (
@@ -93,129 +92,46 @@ def init_db():
 
 init_db()
 
-# ---------------- Utils ----------------
-
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-
-def parse_iso(dt_str: str | None) -> Optional[datetime]:
-    if not dt_str:
-        return None
-    try:
-        # handles "2025-12-15T20:32:18.708Z" or "...+00:00"
-        s = dt_str.replace("Z", "+00:00")
-        return datetime.fromisoformat(s)
-    except Exception:
-        return None
-
-
-def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    # distance in meters
-    R = 6371000.0
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(a))
-
-
-def send_push_notification(token: str, title: str, body: str, data: dict | None = None):
-    payload = {
-        "to": token,
-        "sound": "default",
-        "title": title,
-        "body": body,
-        "data": data or {},
-    }
-    try:
-        resp = requests.post(EXPO_PUSH_URL, json=payload, timeout=8)
-        print("Expo push resp:", resp.status_code, resp.text)
-    except Exception as e:
-        print("Erreur envoi push :", e)
-
-
-def choose_nearest_online_driver(pickup_lat: float, pickup_lng: float, max_age_seconds: int = 180) -> Optional[str]:
-    """
-    Retourne l'id du chauffeur ONLINE le plus proche.
-    max_age_seconds : on ignore les chauffeurs qui n'ont pas envoyé de position récemment.
-    """
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id, latitude, longitude, status, updated_at FROM drivers")
-    rows = cur.fetchall()
-    conn.close()
-
-    now = datetime.now(timezone.utc)
-
-    best_id = None
-    best_dist = None
-
-    for r in rows:
-        status = (r["status"] or "").lower()
-        if status != "online":
-            continue
-
-        lat = r["latitude"]
-        lng = r["longitude"]
-        if lat is None or lng is None:
-            continue
-
-        updated_at = parse_iso(r["updated_at"])
-        if not updated_at:
-            continue
-
-        # ensure timezone-aware
-        if updated_at.tzinfo is None:
-            updated_at = updated_at.replace(tzinfo=timezone.utc)
-
-        age = (now - updated_at).total_seconds()
-        if age > max_age_seconds:
-            continue
-
-        d = haversine_m(pickup_lat, pickup_lng, float(lat), float(lng))
-        if best_dist is None or d < best_dist:
-            best_dist = d
-            best_id = r["id"]
-
-    return best_id
-
-
-# ---------------- Models ----------------
+# ----------------- MODELES -----------------
 
 class UpdateLocation(BaseModel):
     driver_id: str
     latitude: float
     longitude: float
-    status: str
-
-
-class PushTokenRegister(BaseModel):
-    driver_id: str
-    expo_push_token: str
+    status: str # "online"/"offline"
 
 
 class JobCreate(BaseModel):
-    # ✅ supporte driver_id OU chosen_driver_id (alias venant de la centrale)
-    driver_id: Optional[str] = None
-    chosen_driver_id: Optional[str] = Field(default=None)
-
+    driver_id: str
     customer_name: str
     address: str
     phone: str
     comment: Optional[str] = ""
 
-    # ✅ coordonnées départ (pour choisir le plus proche)
-    pickup_lat: Optional[float] = None
-    pickup_lng: Optional[float] = None
 
-    # optionnel, on ignore si fourni
-    created_at: Optional[str] = None
+class JobOfferCreate(BaseModel):
+    # Pour le dispatch auto (multi-proposition)
+    pickup_lat: float
+    pickup_lng: float
+    customer_name: str
+    address: str
+    phone: str
+    comment: Optional[str] = ""
+    offer_timeout_sec: Optional[int] = 20 # délai avant de proposer au suivant
+    max_drivers: Optional[int] = 10 # combien de chauffeurs max à tenter
 
 
 class JobStatusUpdate(BaseModel):
     status: str
+
+
+class JobDecision(BaseModel):
+    driver_id: str
+
+
+class PushTokenRegister(BaseModel):
+    driver_id: str
+    expo_push_token: str
 
 
 class DocumentOut(BaseModel):
@@ -230,7 +146,7 @@ class DocumentRename(BaseModel):
     title: Optional[str] = None
 
 
-# ---------------- FastAPI ----------------
+# ----------------- FASTAPI -----------------
 
 app = FastAPI()
 
@@ -242,13 +158,52 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------- Drivers endpoints ----------------
+EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
+
+
+def send_push_notification(token: str, title: str, body: str, data: dict | None = None):
+    payload = {
+        "to": token,
+        "sound": "default",
+        "title": title,
+        "body": body,
+        "data": data or {},
+    }
+    try:
+        resp = requests.post(EXPO_PUSH_URL, json=payload, timeout=5)
+        print("Expo push resp:", resp.status_code, resp.text)
+    except Exception as e:
+        print("Erreur envoi push :", e)
+
+
+# ----------------- OUTILS DISTANCE -----------------
+
+def haversine_km(lat1, lon1, lat2, lon2) -> float:
+    # distance à vol d’oiseau
+    R = 6371.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+
+def utc_now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+
+def iso_to_dt(s: str) -> datetime:
+    return datetime.fromisoformat(s)
+
+
+# ----------------- ENDPOINTS CHAUFFEURS -----------------
 
 @app.post("/update-location")
 def update_location(body: UpdateLocation):
     conn = get_db()
     cur = conn.cursor()
-
     now = utc_now_iso()
 
     cur.execute(
@@ -309,37 +264,10 @@ def register_push_token(body: PushTokenRegister):
     conn.close()
     return {"ok": True}
 
-# ---------------- Jobs internals ----------------
 
-def _resolve_driver_id(body: JobCreate) -> str:
-    """
-    Ordre de priorité :
-    1) chosen_driver_id
-    2) driver_id
-    3) nearest online driver (si pickup_lat/pickup_lng fournis)
-    """
-    chosen = (body.chosen_driver_id or "").strip()
-    if chosen:
-        return chosen
+# ----------------- CREATION COURSE + NOTIF (ancienne logique) -----------------
 
-    direct = (body.driver_id or "").strip()
-    if direct:
-        return direct
-
-    if body.pickup_lat is not None and body.pickup_lng is not None:
-        nearest = choose_nearest_online_driver(body.pickup_lat, body.pickup_lng)
-        if nearest:
-            return nearest
-
-    raise HTTPException(
-        status_code=422,
-        detail="Aucun driver_id/chosen_driver_id fourni, et impossible de choisir un chauffeur (pickup_lat/pickup_lng manquants ou aucun chauffeur online récent)."
-    )
-
-
-def _create_job_and_notify(body: JobCreate) -> dict:
-    driver_id = _resolve_driver_id(body)
-
+def _create_job_and_notify(body: JobCreate) -> str:
     conn = get_db()
     cur = conn.cursor()
 
@@ -349,27 +277,23 @@ def _create_job_and_notify(body: JobCreate) -> dict:
     cur.execute(
         """
         INSERT INTO jobs (
-            id, driver_id, customer_name, address, phone, comment, created_at, status, pickup_lat, pickup_lng
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            id, driver_id, customer_name, address, phone, comment, created_at, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             job_id,
-            driver_id,
+            body.driver_id,
             body.customer_name,
             body.address,
             body.phone,
             body.comment or "",
             now,
             "new",
-            body.pickup_lat,
-            body.pickup_lng,
         ),
     )
 
-    # token push du chauffeur
-    cur.execute("SELECT expo_push_token FROM drivers WHERE id = ?", (driver_id,))
+    cur.execute("SELECT expo_push_token FROM drivers WHERE id = ?", (body.driver_id,))
     row = cur.fetchone()
-
     conn.commit()
     conn.close()
 
@@ -378,24 +302,324 @@ def _create_job_and_notify(body: JobCreate) -> dict:
             row["expo_push_token"],
             "Nouvelle course",
             f"{body.customer_name} - {body.address}",
-            {"driver_id": driver_id, "job_id": job_id},
+            {"driver_id": body.driver_id, "job_id": job_id, "type": "job_new"},
         )
 
-    return {"job_id": job_id, "assigned_driver_id": driver_id}
+    return job_id
 
-# ---------------- Jobs endpoints ----------------
+
+# ----------------- DISPATCH AUTO (multi-proposition) -----------------
+
+def _get_online_drivers_sorted(pickup_lat: float, pickup_lng: float, max_drivers: int) -> List[str]:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, latitude, longitude, status FROM drivers WHERE status = 'online'")
+    rows = cur.fetchall()
+    conn.close()
+
+    scored = []
+    for r in rows:
+        if r["latitude"] is None or r["longitude"] is None:
+            continue
+        d = haversine_km(pickup_lat, pickup_lng, float(r["latitude"]), float(r["longitude"]))
+        scored.append((d, r["id"]))
+
+    scored.sort(key=lambda x: x[0])
+    return [driver_id for _, driver_id in scored[: max_drivers]]
+
+
+def _push_offer_to_driver(driver_id: str, job_id: str, customer_name: str, address: str):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT expo_push_token FROM drivers WHERE id = ?", (driver_id,))
+    row = cur.fetchone()
+    conn.close()
+
+    if row and row["expo_push_token"]:
+        send_push_notification(
+            row["expo_push_token"],
+            "Course proposée",
+            f"{customer_name} - {address}",
+            {"job_id": job_id, "type": "job_offer"},
+        )
+
+
+def _create_offer_job(body: JobOfferCreate) -> dict:
+    queue = _get_online_drivers_sorted(body.pickup_lat, body.pickup_lng, body.max_drivers or 10)
+    if not queue:
+        raise HTTPException(status_code=409, detail="Aucun chauffeur online disponible")
+
+    job_id = str(uuid.uuid4())
+    now = datetime.utcnow()
+    expires = now + timedelta(seconds=int(body.offer_timeout_sec or 20))
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT INTO jobs (
+            id, driver_id, customer_name, address, phone, comment, created_at, status,
+            pickup_lat, pickup_lng, offered_queue, offer_index, current_offer_driver, offer_expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            job_id,
+            None,
+            body.customer_name,
+            body.address,
+            body.phone,
+            body.comment or "",
+            now.isoformat(),
+            "offered",
+            float(body.pickup_lat),
+            float(body.pickup_lng),
+            json.dumps(queue),
+            0,
+            queue[0],
+            expires.isoformat(),
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+    _push_offer_to_driver(queue[0], job_id, body.customer_name, body.address)
+
+    return {"ok": True, "job_id": job_id, "offered_to": queue[0], "queue_size": len(queue)}
+
+
+def _advance_offer(job_row: sqlite3.Row, force_next: bool = False) -> Optional[str]:
+    """
+    Passe au chauffeur suivant. Retourne le driver_id proposé ou None si fin.
+    """
+    queue = []
+    try:
+        queue = json.loads(job_row["offered_queue"] or "[]")
+    except Exception:
+        queue = []
+
+    idx = int(job_row["offer_index"] or 0)
+    if force_next:
+        idx += 1
+    else:
+        # timeout → on passe au suivant
+        idx += 1
+
+    if idx >= len(queue):
+        return None
+
+    return queue[idx]
+
+
+async def offer_watcher_loop():
+    """
+    Boucle qui surveille les jobs en "offered" expirés et propose au suivant.
+    """
+    while True:
+        try:
+            conn = get_db()
+            cur = conn.cursor()
+
+            cur.execute("SELECT * FROM jobs WHERE status = 'offered' AND offer_expires_at IS NOT NULL")
+            rows = cur.fetchall()
+
+            now = datetime.utcnow()
+
+            for r in rows:
+                try:
+                    exp = iso_to_dt(r["offer_expires_at"])
+                except Exception:
+                    continue
+
+                if now < exp:
+                    continue
+
+                next_driver = _advance_offer(r, force_next=True)
+
+                if not next_driver:
+                    # plus personne → non attribuée
+                    cur.execute(
+                        """
+                        UPDATE jobs
+                        SET status = 'unassigned',
+                            current_offer_driver = NULL,
+                            offer_expires_at = NULL
+                        WHERE id = ?
+                        """,
+                        (r["id"],),
+                    )
+                    continue
+
+                # update offer
+                new_idx = int(r["offer_index"] or 0) + 1
+                new_exp = now + timedelta(seconds=20) # même délai par défaut ici
+                cur.execute(
+                    """
+                    UPDATE jobs
+                    SET offer_index = ?,
+                        current_offer_driver = ?,
+                        offer_expires_at = ?
+                    WHERE id = ?
+                    """,
+                    (new_idx, next_driver, new_exp.isoformat(), r["id"]),
+                )
+
+                _push_offer_to_driver(next_driver, r["id"], r["customer_name"], r["address"])
+
+            conn.commit()
+            conn.close()
+
+        except Exception as e:
+            print("offer_watcher_loop error:", e)
+
+        await asyncio.sleep(2)
+
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(offer_watcher_loop())
+
+
+# ----------------- ENDPOINTS COURSES -----------------
 
 @app.post("/jobs")
 def create_job(body: JobCreate):
-    result = _create_job_and_notify(body)
-    return {"ok": True, **result}
+    job_id = _create_job_and_notify(body)
+    return {"ok": True, "job_id": job_id}
 
 
 @app.post("/send-job")
 def send_job(body: JobCreate):
-    # ancien endpoint conservé
-    result = _create_job_and_notify(body)
-    return {"ok": True, **result}
+    job_id = _create_job_and_notify(body)
+    return {"ok": True, "job_id": job_id}
+
+
+# ✅ NOUVEAU : envoi auto au plus proche puis cascade
+@app.post("/jobs/send-nearest")
+def send_nearest(body: JobOfferCreate):
+    return _create_offer_job(body)
+
+
+# Chauffeur : récupérer les courses "proposées" à lui
+@app.get("/jobs/offers/{driver_id}")
+def get_offers_for_driver(driver_id: str):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT * FROM jobs
+        WHERE status = 'offered'
+          AND current_offer_driver = ?
+        ORDER BY created_at DESC
+        """,
+        (driver_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    return [
+        {
+            "id": r["id"],
+            "customer_name": r["customer_name"],
+            "address": r["address"],
+            "phone": r["phone"],
+            "comment": r["comment"],
+            "created_at": r["created_at"],
+            "status": r["status"],
+            "pickup_lat": r["pickup_lat"],
+            "pickup_lng": r["pickup_lng"],
+            "offer_expires_at": r["offer_expires_at"],
+        }
+        for r in rows
+    ]
+
+
+# Chauffeur : accepter
+@app.post("/jobs/{job_id}/accept")
+def accept_job(job_id: str, body: JobDecision):
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
+    job = cur.fetchone()
+    if not job:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job["status"] != "offered" or job["current_offer_driver"] != body.driver_id:
+        conn.close()
+        raise HTTPException(status_code=409, detail="Cette course n'est pas proposée à ce chauffeur")
+
+    cur.execute(
+        """
+        UPDATE jobs
+        SET driver_id = ?,
+            status = 'accepted',
+            current_offer_driver = NULL,
+            offer_expires_at = NULL
+        WHERE id = ?
+        """,
+        (body.driver_id, job_id),
+    )
+
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
+# Chauffeur : refuser (passe immédiatement au suivant)
+@app.post("/jobs/{job_id}/decline")
+def decline_job(job_id: str, body: JobDecision):
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
+    job = cur.fetchone()
+    if not job:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job["status"] != "offered" or job["current_offer_driver"] != body.driver_id:
+        conn.close()
+        raise HTTPException(status_code=409, detail="Cette course n'est pas proposée à ce chauffeur")
+
+    next_driver = _advance_offer(job, force_next=True)
+    now = datetime.utcnow()
+
+    if not next_driver:
+        cur.execute(
+            """
+            UPDATE jobs
+            SET status = 'unassigned',
+                current_offer_driver = NULL,
+                offer_expires_at = NULL
+            WHERE id = ?
+            """,
+            (job_id,),
+        )
+        conn.commit()
+        conn.close()
+        return {"ok": True, "next": None}
+
+    new_idx = int(job["offer_index"] or 0) + 1
+    new_exp = now + timedelta(seconds=20)
+
+    cur.execute(
+        """
+        UPDATE jobs
+        SET offer_index = ?,
+            current_offer_driver = ?,
+            offer_expires_at = ?
+        WHERE id = ?
+        """,
+        (new_idx, next_driver, new_exp.isoformat(), job_id),
+    )
+    conn.commit()
+    conn.close()
+
+    _push_offer_to_driver(next_driver, job_id, job["customer_name"], job["address"])
+    return {"ok": True, "next": next_driver}
 
 
 @app.get("/jobs/{driver_id}")
@@ -419,8 +643,6 @@ def get_jobs(driver_id: str):
             "comment": r["comment"],
             "created_at": r["created_at"],
             "status": r["status"],
-            "pickup_lat": r["pickup_lat"],
-            "pickup_lng": r["pickup_lng"],
         }
         for r in rows
     ]
@@ -459,7 +681,8 @@ def delete_job(job_id: str):
     conn.close()
     return {"ok": True}
 
-# ---------------- Documents endpoints ----------------
+
+# ----------------- ENDPOINTS DOCUMENTS -----------------
 
 @app.post("/documents/upload", response_model=DocumentOut)
 async def upload_document(
@@ -574,7 +797,6 @@ def rename_document(doc_id: str, body: DocumentRename):
         raise HTTPException(status_code=404, detail="Document introuvable")
 
     new_title = body.title if body.title is not None else row["title"]
-
     cur.execute("UPDATE documents SET title = ? WHERE id = ?", (new_title, doc_id))
     conn.commit()
 
@@ -612,5 +834,4 @@ def delete_document(doc_id: str):
     cur.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
     conn.commit()
     conn.close()
-
     return {"ok": True}

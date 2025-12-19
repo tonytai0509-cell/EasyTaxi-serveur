@@ -123,10 +123,9 @@ class JobCreate(BaseModel):
 class AutoJobCreate(BaseModel):
     pickup_lat: float
     pickup_lng: float
+    customer_name: str
     address: str
     phone: str
-    # ✅ Option B : le nom est optionnel, on mettra "Client" si vide
-    customer_name: Optional[str] = ""
     comment: Optional[str] = ""
     max_age_sec: Optional[int] = 120
     max_radius_km: Optional[float] = 50.0
@@ -310,7 +309,7 @@ def _create_job_and_notify(
     # root_job_id : si absent => le job devient sa propre racine
     root = root_job_id or job_id
 
-    offer_expires_at = None # pour les offres seulement
+    offer_expires_at = None # <= par défaut, pas de TTL sur les jobs "new"
     if status == "offered":
         ttl = int(offer_ttl_sec or 180)
         offer_expires_at = (datetime.utcnow() + timedelta(seconds=ttl)).isoformat()
@@ -464,7 +463,7 @@ def send_job(body: JobCreate):
     )
     return {"ok": True, "job_id": job_id}
 
-# ✅ DIRECT : auto -> new
+# DIRECT : AUTO -> new
 @app.post("/send-job-auto")
 def send_job_auto(body: AutoJobCreate):
     pick = _pick_nearest_online_driver(
@@ -475,17 +474,11 @@ def send_job_auto(body: AutoJobCreate):
         exclude_driver_ids=set(),
     )
     if not pick:
-        raise HTTPException(
-            status_code=404,
-            detail="Aucun chauffeur online proche (position trop ancienne ou trop loin).",
-        )
-
-    # ✅ Solution B : si pas de nom => "Client"
-    customer_name = (body.customer_name or "").strip() or "Client"
+        raise HTTPException(status_code=404, detail="Aucun chauffeur online proche (position trop ancienne ou trop loin).")
 
     job_id = _create_job_and_notify(
         driver_id=pick["driver_id"],
-        customer_name=customer_name,
+        customer_name=body.customer_name,
         address=body.address,
         phone=body.phone,
         comment=body.comment or "",
@@ -502,7 +495,7 @@ def send_job_auto(body: AutoJobCreate):
         "driver_updated_at": pick["updated_at"],
     }
 
-# ✅ OFFERS : auto -> offered
+# OFFERS : AUTO -> offered
 @app.post("/send-job-auto-offer")
 def send_job_auto_offer(body: AutoJobCreate):
     pick = _pick_nearest_online_driver(
@@ -513,17 +506,11 @@ def send_job_auto_offer(body: AutoJobCreate):
         exclude_driver_ids=set(),
     )
     if not pick:
-        raise HTTPException(
-            status_code=404,
-            detail="Aucun chauffeur online proche (position trop ancienne ou trop loin).",
-        )
-
-    # ✅ Solution B : si pas de nom => "Client"
-    customer_name = (body.customer_name or "").strip() or "Client"
+        raise HTTPException(status_code=404, detail="Aucun chauffeur online proche (position trop ancienne ou trop loin).")
 
     job_id = _create_job_and_notify(
         driver_id=pick["driver_id"],
-        customer_name=customer_name,
+        customer_name=body.customer_name,
         address=body.address,
         phone=body.phone,
         comment=body.comment or "",
@@ -542,7 +529,7 @@ def send_job_auto_offer(body: AutoJobCreate):
         "driver_updated_at": pick["updated_at"],
     }
 
-# ✅ Chauffeur: récupère SES courses (pas les offered/declined)
+# Chauffeur: récupère ses courses (pas les offered/declined)
 @app.get("/jobs/{driver_id}")
 def get_jobs(driver_id: str):
     conn = get_db()
@@ -576,7 +563,7 @@ def get_jobs(driver_id: str):
         for r in rows
     ]
 
-# ✅ OFFERS: le chauffeur lit ses offres (expire => declined + redistribue)
+# OFFERS: le chauffeur lit ses offres (expire => declined + redistribue)
 @app.get("/jobs/offers/{driver_id}")
 def get_offers(driver_id: str):
     conn = get_db()
@@ -599,10 +586,7 @@ def get_offers(driver_id: str):
             mark_declined(root, str(r["driver_id"]))
 
             # passer declined
-            cur.execute(
-                "UPDATE jobs SET status='declined', offer_expires_at=NULL WHERE id = ?",
-                (r["id"],),
-            )
+            cur.execute("UPDATE jobs SET status='declined', offer_expires_at=NULL WHERE id = ?", (r["id"],))
             conn.commit()
 
             # redistribution (TTL 180 par défaut)
@@ -634,7 +618,7 @@ def get_offers(driver_id: str):
     conn.close()
     return offers
 
-# ✅ OFFERS: accepter (offered -> new)
+# OFFERS: accepter (offered -> new)
 @app.post("/jobs/{job_id}/accept")
 def accept_offer(job_id: str, body: OfferDecision):
     conn = get_db()
@@ -657,23 +641,17 @@ def accept_offer(job_id: str, body: OfferDecision):
     if is_offer_expired(r["offer_expires_at"]):
         root = str(r["root_job_id"] or r["id"])
         mark_declined(root, str(r["driver_id"]))
-        cur.execute(
-            "UPDATE jobs SET status='declined', offer_expires_at=NULL WHERE id = ?",
-            (job_id,),
-        )
+        cur.execute("UPDATE jobs SET status='declined', offer_expires_at=NULL WHERE id = ?", (job_id,))
         conn.commit()
         conn.close()
         raise HTTPException(status_code=410, detail="Offer expired")
 
-    cur.execute(
-        "UPDATE jobs SET status='new', offer_expires_at=NULL WHERE id = ?",
-        (job_id,),
-    )
+    cur.execute("UPDATE jobs SET status='new', offer_expires_at=NULL WHERE id = ?", (job_id,))
     conn.commit()
     conn.close()
     return {"ok": True}
 
-# ✅ OFFERS: refuser (offered -> declined) + redistribution auto
+# OFFERS: refuser (offered -> declined) + redistribution auto
 @app.post("/jobs/{job_id}/decline")
 def decline_offer(job_id: str, body: OfferDecision):
     conn = get_db()
@@ -696,10 +674,7 @@ def decline_offer(job_id: str, body: OfferDecision):
     root = str(r["root_job_id"] or r["id"])
     mark_declined(root, str(body.driver_id))
 
-    cur.execute(
-        "UPDATE jobs SET status='declined', offer_expires_at=NULL WHERE id = ?",
-        (job_id,),
-    )
+    cur.execute("UPDATE jobs SET status='declined', offer_expires_at=NULL WHERE id = ?", (job_id,))
     conn.commit()
     conn.close()
 
@@ -712,37 +687,42 @@ def decline_offer(job_id: str, body: OfferDecision):
 
     return {"ok": True, "redistributed": redistributed}
 
-@app.post("/jobs/{job_id}/status")
-def update_job_status(job_id: str, body: JobStatusUpdate):
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute("SELECT id FROM jobs WHERE id = ?", (job_id,))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    cur.execute("UPDATE jobs SET status = ? WHERE id = ?", (body.status, job_id))
-    conn.commit()
-    conn.close()
-    return {"ok": True}
-
+# SUPPRIMER : si c’est une course AUTO, on la considère comme refusée + redistribution
 @app.delete("/jobs/{job_id}")
 def delete_job(job_id: str):
     conn = get_db()
     cur = conn.cursor()
 
-    cur.execute("SELECT id FROM jobs WHERE id = ?", (job_id,))
+    cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
     row = cur.fetchone()
     if not row:
         conn.close()
         raise HTTPException(status_code=404, detail="Job not found")
 
+    # On prépare les infos pour éventuellement redistribuer
+    root_job_id = str(row["root_job_id"] or row["id"])
+    driver_id = str(row["driver_id"])
+
+    redistributed = None
+
+    # Si la course vient d'un AUTO (on a un point de prise en charge)
+    # et qu’elle n’est pas terminée, on la traite comme un refus
+    if row["status"] in ("new", "accepted") and row["pickup_lat"] is not None and row["pickup_lng"] is not None:
+        mark_declined(root_job_id, driver_id)
+
+        redistributed = _redistribute_offer_from_job(
+            job_row=row,
+            max_age_sec=120,
+            max_radius_km=50.0,
+            offer_ttl_sec=180,
+        )
+
+    # On supprime quand même la course pour ce chauffeur
     cur.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
     conn.commit()
     conn.close()
-    return {"ok": True}
+
+    return {"ok": True, "redistributed": redistributed}
 
 # ---------------- DEBUG ----------------
 
@@ -816,13 +796,7 @@ async def upload_document(
     conn.commit()
     conn.close()
 
-    return DocumentOut(
-        id=doc_id,
-        driver_id=driver_id,
-        title=title,
-        created_at=created_at,
-        original_name=file.filename or "",
-    )
+    return DocumentOut(id=doc_id, driver_id=driver_id, title=title, created_at=created_at, original_name=file.filename or "")
 
 @app.get("/documents", response_model=List[DocumentOut])
 def list_documents():

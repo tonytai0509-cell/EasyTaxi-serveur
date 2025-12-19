@@ -129,7 +129,7 @@ class AutoJobCreate(BaseModel):
     comment: Optional[str] = ""
     max_age_sec: Optional[int] = 120
     max_radius_km: Optional[float] = 50.0
-    offer_ttl_sec: Optional[int] = 180 # défaut 180s
+    offer_ttl_sec: Optional[int] = 180 # 3 minutes
 
 class JobStatusUpdate(BaseModel):
     status: str
@@ -141,11 +141,15 @@ class PushTokenRegister(BaseModel):
 class OfferDecision(BaseModel):
     driver_id: str
 
-# 🔔 Nouveau : modèle pour message de la centrale
+# 🔔 message simple centrale -> chauffeur
 class CentralMessage(BaseModel):
     driver_id: str
     title: str
     body: str
+
+# 🔔 nouveau : bouton "Occupé"
+class BusyDecision(BaseModel):
+    driver_id: str
 
 class DocumentOut(BaseModel):
     id: str
@@ -219,7 +223,7 @@ def get_declined_driver_ids(root_job_id: str) -> Set[str]:
     cur.execute("SELECT driver_id FROM job_declines WHERE root_job_id = ?", (root_job_id,))
     rows = cur.fetchall()
     conn.close()
-    return set([str(r["driver_id"]) for r in rows])
+    return set(str(r["driver_id"]) for r in rows)
 
 def mark_declined(root_job_id: str, driver_id: str):
     conn = get_db()
@@ -685,6 +689,49 @@ def decline_offer(job_id: str, body: OfferDecision):
 
     return {"ok": True, "redistributed": redistributed}
 
+# 🔴 NOUVEL ENDPOINT : bouton "Occupé" sur une course auto
+@app.post("/jobs/{job_id}/busy")
+def busy_job(job_id: str, body: BusyDecision):
+    """
+    Utilisé par le bouton 'Occupé' dans l'app chauffeur
+    pour une course issue du mode AUTO :
+    - marque ce chauffeur comme ayant refusé (pour root_job_id)
+    - supprime la course de ce chauffeur
+    - redistribue au prochain chauffeur le plus proche
+    """
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
+    r = cur.fetchone()
+
+    if not r:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if str(r["driver_id"]) != str(body.driver_id):
+        conn.close()
+        raise HTTPException(status_code=403, detail="Not your job")
+
+    root = str(r["root_job_id"] or r["id"])
+
+    # on note ce chauffeur comme "refusé" pour cette course racine
+    mark_declined(root, str(body.driver_id))
+
+    # on supprime la course pour lui
+    cur.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+    conn.commit()
+    conn.close()
+
+    # redistribue (si pickup_lat/lng connus)
+    redistributed = _redistribute_offer_from_job(
+        job_row=r,
+        max_age_sec=120,
+        max_radius_km=50.0,
+        offer_ttl_sec=180,
+    )
+
+    return {"ok": True, "redistributed": redistributed}
+
 @app.post("/jobs/{job_id}/status")
 def update_job_status(job_id: str, body: JobStatusUpdate):
     conn = get_db()
@@ -721,9 +768,6 @@ def delete_job(job_id: str):
 
 @app.post("/send-message")
 def send_message(msg: CentralMessage):
-    """
-    Envoi d'un simple message push à UN chauffeur sélectionné (depuis la centrale).
-    """
     conn = get_db()
     cur = conn.cursor()
     cur.execute("SELECT expo_push_token FROM drivers WHERE id = ?", (str(msg.driver_id),))

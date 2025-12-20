@@ -292,24 +292,16 @@ def update_location(body: UpdateLocation):
     return {"ok": True}
 
 
-@app.get("/drivers")
-def list_drivers():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM drivers")
-    rows = cur.fetchall()
-    conn.close()
+<Tabs.Screen
+  name="explore"
+  options={{
+    title: 'Courses', // <-- nouveau titre d’onglet
+    tabBarIcon: ({ color }) => (
+      <IconSymbol size={28} name="paperplane.fill" color={color} />
+    ),
+  }}
+/>
 
-    return [
-        {
-            "id": r["id"],
-            "latitude": r["latitude"],
-            "longitude": r["longitude"],
-            "status": r["status"],
-            "updated_at": r["updated_at"],
-        }
-        for r in rows
-    ]
 
 
 @app.post("/register-push-token")
@@ -1087,3 +1079,4 @@ def delete_document(doc_id: str):
     conn.close()
 
     return {"ok": True}
+

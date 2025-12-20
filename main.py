@@ -18,7 +18,6 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ---------------- DB ----------------
 
-
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -111,7 +110,6 @@ init_db()
 
 # ---------------- MODELS ----------------
 
-
 class UpdateLocation(BaseModel):
     driver_id: str
     latitude: float
@@ -136,7 +134,7 @@ class AutoJobCreate(BaseModel):
     comment: Optional[str] = ""
     max_age_sec: Optional[int] = 120
     max_radius_km: Optional[float] = 50.0
-    offer_ttl_sec: Optional[int] = 180  # 3 minutes
+    offer_ttl_sec: Optional[int] = 180 # 3 minutes
 
 
 class JobStatusUpdate(BaseModel):
@@ -213,16 +211,13 @@ def send_push_notification(
 
 # ---------------- UTILS ----------------
 
-
 def haversine_km(lat1, lon1, lat2, lon2) -> float:
     R = 6371.0
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dl = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(
-        dl / 2
-    ) ** 2
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dl / 2) ** 2
     return 2 * R * math.asin(math.sqrt(a))
 
 
@@ -230,7 +225,7 @@ def parse_iso(dt_str: str) -> Optional[datetime]:
     try:
         s = (dt_str or "").replace("Z", "")
         return datetime.fromisoformat(s)
-    except Exception:
+    except:
         return None
 
 
@@ -246,9 +241,7 @@ def is_offer_expired(offer_expires_at: Optional[str]) -> bool:
 def get_declined_driver_ids(root_job_id: str) -> Set[str]:
     conn = get_db()
     cur = conn.cursor()
-    cur.execute(
-        "SELECT driver_id FROM job_declines WHERE root_job_id = ?", (root_job_id,)
-    )
+    cur.execute("SELECT driver_id FROM job_declines WHERE root_job_id = ?", (root_job_id,))
     rows = cur.fetchall()
     conn.close()
     return set(str(r["driver_id"]) for r in rows)
@@ -269,7 +262,6 @@ def mark_declined(root_job_id: str, driver_id: str):
 
 
 # ---------------- DRIVER ENDPOINTS ----------------
-
 
 @app.post("/update-location")
 def update_location(body: UpdateLocation):
@@ -292,16 +284,24 @@ def update_location(body: UpdateLocation):
     return {"ok": True}
 
 
-<Tabs.Screen
-  name="explore"
-  options={{
-    title: 'Courses', // <-- nouveau titre d’onglet
-    tabBarIcon: ({ color }) => (
-      <IconSymbol size={28} name="paperplane.fill" color={color} />
-    ),
-  }}
-/>
+@app.get("/drivers")
+def list_drivers():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM drivers")
+    rows = cur.fetchall()
+    conn.close()
 
+    return [
+        {
+            "id": r["id"],
+            "latitude": r["latitude"],
+            "longitude": r["longitude"],
+            "status": r["status"],
+            "updated_at": r["updated_at"],
+        }
+        for r in rows
+    ]
 
 
 @app.post("/register-push-token")
@@ -323,7 +323,6 @@ def register_push_token(body: PushTokenRegister):
 
 
 # ---------------- JOB CORE ----------------
-
 
 def _create_job_and_notify(
     driver_id: str,
@@ -415,13 +414,6 @@ def _pick_nearest_online_driver(
     max_radius_km: float,
     exclude_driver_ids: Optional[Set[str]] = None,
 ):
-    """
-    Cherche le chauffeur online le plus proche.
-
-    1er passage : on respecte max_age_sec (position récente).
-    2e passage (secours) : on ignore max_age_sec, pour éviter les erreurs
-    "aucun chauffeur online" alors que des taxis sont quand même online.
-    """
     exclude_driver_ids = exclude_driver_ids or set()
 
     conn = get_db()
@@ -430,55 +422,40 @@ def _pick_nearest_online_driver(
     rows = cur.fetchall()
     conn.close()
 
-    def pick_best(check_age: bool):
-        now = datetime.utcnow()
-        best = None
+    now = datetime.utcnow()
+    best = None
 
-        for r in rows:
-            did = str(r["id"])
-            if did in exclude_driver_ids:
-                continue
+    for r in rows:
+        did = str(r["id"])
+        if did in exclude_driver_ids:
+            continue
 
-            lat = r["latitude"]
-            lng = r["longitude"]
-            if lat is None or lng is None:
-                continue
+        lat = r["latitude"]
+        lng = r["longitude"]
+        if lat is None or lng is None:
+            continue
 
-            if check_age:
-                dt = parse_iso(r["updated_at"] or "")
-                if not dt:
-                    continue
-                if (now - dt) > timedelta(seconds=int(max_age_sec or 120)):
-                    # position trop vieille
-                    continue
+        dt = parse_iso(r["updated_at"] or "")
+        if not dt:
+            continue
+        if (now - dt) > timedelta(seconds=int(max_age_sec or 120)):
+            continue
 
-            d = haversine_km(
-                float(pickup_lat), float(pickup_lng), float(lat), float(lng)
-            )
-            if d > float(max_radius_km or 50.0):
-                continue
+        d = haversine_km(float(pickup_lat), float(pickup_lng), float(lat), float(lng))
+        if d > float(max_radius_km or 50.0):
+            continue
 
-            if best is None or d < best["distance_km"]:
-                best = {
-                    "driver_id": did,
-                    "distance_km": d,
-                    "updated_at": r["updated_at"],
-                }
+        if best is None or d < best["distance_km"]:
+            best = {
+                "driver_id": did,
+                "distance_km": d,
+                "updated_at": r["updated_at"],
+            }
 
-        return best
-
-    # 1️⃣ Essai avec limite d'âge
-    best = pick_best(check_age=True)
-    if best:
-        return best
-
-    # 2️⃣ Essai sans limite d'âge (secours)
-    return pick_best(check_age=False)
+    return best
 
 
-def _redistribute_offer_from_job(
-    job_row, max_age_sec: int, max_radius_km: float, offer_ttl_sec: int
-):
+def _redistribute_offer_from_job(job_row, max_age_sec: int, max_radius_km: float, offer_ttl_sec: int):
     pickup_lat = job_row["pickup_lat"]
     pickup_lng = job_row["pickup_lng"]
     if pickup_lat is None or pickup_lng is None:
@@ -521,15 +498,10 @@ def _redistribute_offer_from_job(
 
 # ---------------- JOB ENDPOINTS ----------------
 
-
 @app.post("/jobs")
 def create_job(body: JobCreate):
     job_id = _create_job_and_notify(
-        body.driver_id,
-        body.customer_name,
-        body.address,
-        body.phone,
-        body.comment or "",
+        body.driver_id, body.customer_name, body.address, body.phone, body.comment or ""
     )
     return {"ok": True, "job_id": job_id}
 
@@ -537,11 +509,7 @@ def create_job(body: JobCreate):
 @app.post("/send-job")
 def send_job(body: JobCreate):
     job_id = _create_job_and_notify(
-        body.driver_id,
-        body.customer_name,
-        body.address,
-        body.phone,
-        body.comment or "",
+        body.driver_id, body.customer_name, body.address, body.phone, body.comment or ""
     )
     return {"ok": True, "job_id": job_id}
 
@@ -620,13 +588,17 @@ def send_job_auto_offer(body: AutoJobCreate):
 
 @app.get("/jobs/{driver_id}")
 def get_jobs(driver_id: str):
+    """
+    Liste des jobs pour l'app chauffeur :
+    on exclut les 'offered', 'declined' et 'busy'.
+    """
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
         """
         SELECT * FROM jobs
         WHERE driver_id = ?
-          AND status NOT IN ('offered','declined')
+          AND status NOT IN ('offered','declined','busy')
         ORDER BY created_at DESC
         """,
         (str(driver_id),),
@@ -652,6 +624,55 @@ def get_jobs(driver_id: str):
     ]
 
 
+@app.get("/jobs-central")
+def jobs_central():
+    """
+    Vue centrale : historique des jobs (manuel + AUTO) avec statut.
+    Utilisé par l'onglet 'Courses' de l'app centrale.
+    """
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+          j.*,
+          d.latitude AS driver_lat,
+          d.longitude AS driver_lng,
+          d.status AS driver_status
+        FROM jobs j
+        LEFT JOIN drivers d ON d.id = j.driver_id
+        ORDER BY j.created_at DESC
+        LIMIT 200
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    out = []
+    for r in rows:
+        out.append(
+            {
+                "id": r["id"],
+                "driver_id": r["driver_id"],
+                "customer_name": r["customer_name"],
+                "address": r["address"],
+                "phone": r["phone"],
+                "comment": r["comment"],
+                "created_at": r["created_at"],
+                "status": r["status"],
+                "pickup_lat": r["pickup_lat"],
+                "pickup_lng": r["pickup_lng"],
+                "root_job_id": r["root_job_id"],
+                "offer_expires_at": r["offer_expires_at"],
+                "driver_lat": r["driver_lat"],
+                "driver_lng": r["driver_lng"],
+                "driver_status": r["driver_status"],
+            }
+        )
+
+    return out
+
+
 @app.get("/jobs/offers/{driver_id}")
 def get_offers(driver_id: str):
     conn = get_db()
@@ -667,8 +688,7 @@ def get_offers(driver_id: str):
     )
     rows = cur.fetchall()
 
-    offers: List[Dict[str, Any]] = []
-
+    offers = []
     for r in rows:
         if is_offer_expired(r["offer_expires_at"]):
             root = str(r["root_job_id"] or r["id"])
@@ -787,17 +807,14 @@ def decline_offer(job_id: str, body: OfferDecision):
     return {"ok": True, "redistributed": redistributed}
 
 
-# 🔴 Bouton "Occupé" sur une course auto
-
-
 @app.post("/jobs/{job_id}/busy")
 def busy_job(job_id: str, body: BusyDecision):
     """
     Utilisé par le bouton 'Occupé' dans l'app chauffeur
     pour une course issue du mode AUTO :
     - marque ce chauffeur comme ayant refusé (pour root_job_id)
-    - supprime la course de ce chauffeur
-    - redistribue au prochain chauffeur le plus proche
+    - garde la course mais en statut 'busy' pour l'historique centrale
+    - redistribue la course au prochain chauffeur le plus proche
     """
     conn = get_db()
     cur = conn.cursor()
@@ -814,11 +831,14 @@ def busy_job(job_id: str, body: BusyDecision):
 
     root = str(r["root_job_id"] or r["id"])
 
-    # on note ce chauffeur comme "refusé" pour cette course racine
+    # ce chauffeur a refusé pour cette course racine
     mark_declined(root, str(body.driver_id))
 
-    # on supprime la course pour lui
-    cur.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+    # on garde la ligne dans jobs, mais marquée busy
+    cur.execute(
+        "UPDATE jobs SET status='busy', offer_expires_at=NULL WHERE id = ?",
+        (job_id,),
+    )
     conn.commit()
     conn.close()
 
@@ -869,14 +889,11 @@ def delete_job(job_id: str):
 
 # ---------------- CENTRAL MESSAGE ENDPOINT ----------------
 
-
 @app.post("/send-message")
 def send_message(msg: CentralMessage):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute(
-        "SELECT expo_push_token FROM drivers WHERE id = ?", (str(msg.driver_id),)
-    )
+    cur.execute("SELECT expo_push_token FROM drivers WHERE id = ?", (str(msg.driver_id),))
     row = cur.fetchone()
     conn.close()
 
@@ -891,9 +908,9 @@ def send_message(msg: CentralMessage):
         msg.title,
         msg.body,
         {
-          "type": "central_message",
-          "driver_id": str(msg.driver_id),
-          "body": msg.body,
+            "type": "central_message",
+            "driver_id": str(msg.driver_id),
+            "body": msg.body,
         },
     )
 
@@ -901,7 +918,6 @@ def send_message(msg: CentralMessage):
 
 
 # ---------------- DEBUG ----------------
-
 
 @app.get("/debug/offers/{driver_id}")
 def debug_offers(driver_id: str):
@@ -924,7 +940,6 @@ def debug_offers(driver_id: str):
 
 # ---------------- DOCUMENTS ----------------
 
-
 @app.post("/documents/upload", response_model=DocumentOut)
 async def upload_document(
     file: UploadFile = File(...),
@@ -938,9 +953,7 @@ async def upload_document(
         or content_type == "application/pdf"
         or content_type == "application/octet-stream"
     ):
-        raise HTTPException(
-            status_code=400, detail=f"Format non supporté ({content_type})"
-        )
+        raise HTTPException(status_code=400, detail=f"Format non supporté ({content_type})")
 
     driver_id = (driver_id or "").strip()
     if driver_id in ("", "undefined", "null"):
@@ -1079,4 +1092,3 @@ def delete_document(doc_id: str):
     conn.close()
 
     return {"ok": True}
-
